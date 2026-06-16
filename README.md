@@ -29,8 +29,11 @@ The widget appears in the top-right corner and refreshes every 5 minutes.
 ./install.sh
 ```
 
-Builds a release binary and registers a LaunchAgent. Logs go to `/tmp/llm-widget.log`.
-Stop with `launchctl bootout gui/$(id -u)/com.llmwidget`.
+Builds the `.app` into `/Applications` and registers a LaunchAgent that runs it at
+login. Logs go to `/tmp/llm-widget.log`. Stop with `launchctl bootout gui/$(id -u)/com.llmwidget`.
+
+Only one instance runs at a time (guarded by a lock in `~/.llm-usage-widget/`), so
+launching the app by hand while the LaunchAgent owns it is a no-op.
 
 ### Enable ChatGPT Codex usage
 
