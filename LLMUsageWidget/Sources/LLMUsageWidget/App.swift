@@ -5,11 +5,21 @@ import OSLog
 private let log = Logger(subsystem: "com.llmwidget", category: "app")
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  let scraper = Scraper()
   var statusItem: NSStatusItem?
+  private var lockFileDescriptor: Int32 = -1
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
+    guard acquireSingleInstanceLock() else {
+      log.notice("Another instance already holds the lock; terminating this one")
+      NSApp.terminate(nil)
+      return
+    }
     log.info("App did finish launching")
+    // Reap orphaned Playwright sessions left by a previous crash/quit. Safe here
+    // because we hold the single-instance lock, so no sibling scrape is live.
+    DispatchQueue.global().async { [scraper] in scraper.reapStaleSessions() }
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = statusItem?.button {
       let img = NSImage(systemSymbolName: "chart.pie.fill", accessibilityDescription: "Usage")
@@ -21,6 +31,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     statusItem?.menu = menu
   }
+
+  // flock on a lockfile in the data dir. The lock is held for the process
+  // lifetime via the open fd and released automatically by the OS on exit or
+  // crash, so a stale lock can never wedge a future launch. Returns false only
+  // when another live instance already holds it.
+  private func acquireSingleInstanceLock() -> Bool {
+    let dataDir = AppPaths().dataDir
+    try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+    let lockPath = dataDir.appendingPathComponent("instance.lock").path
+    let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
+    guard fd >= 0 else {
+      log.warning("acquireSingleInstanceLock: could not open \(lockPath), proceeding anyway")
+      return true  // don't strand the user over a lockfile we can't create
+    }
+    if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+      close(fd)
+      return false
+    }
+    lockFileDescriptor = fd  // keep open to hold the lock
+    return true
+  }
 }
 
 @main struct LLMUsageWidgetApp: App {
@@ -29,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @State private var isLoading = true
   @State private var errorMessage: String?
   @State private var isRefreshing = false
-  let scraper = Scraper()
+  private var scraper: Scraper { appDelegate.scraper }
 
   var body: some Scene {
     WindowGroup {

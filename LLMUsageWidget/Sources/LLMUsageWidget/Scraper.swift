@@ -18,6 +18,11 @@ final class Scraper: @unchecked Sendable {
   private var _lastIssueMessage: String?
   private var _isScrapingChatGPT = false
 
+  // Namespaces every Playwright session this app opens, so the startup reaper
+  // can recognize its own leftovers without touching unrelated sessions the
+  // user may have opened by hand.
+  static let sessionPrefix = "llmwidget-"
+
   // Compiled once — avoids per-cycle regex and DateFormatter allocation
   private static let regexOllamaTrack = try! NSRegularExpression(
     pattern: #"data-usage-track[^>]*aria-label="([^"]*)""#, options: [.dotMatchesLineSeparators])
@@ -190,7 +195,7 @@ final class Scraper: @unchecked Sendable {
     log.info("scrapeChatGPT: using \(browser.profile.browserName) profile at \(browser.profile.profilePath)")
 
     let tmpDir = URL(fileURLWithPath: "/tmp/pwt-\(ProcessInfo.processInfo.globallyUniqueString)")
-    let sessionName = "chatgpt-\(ProcessInfo.processInfo.globallyUniqueString)"
+    let sessionName = "\(Self.sessionPrefix)\(ProcessInfo.processInfo.globallyUniqueString)"
     log.info("scrapeChatGPT: tmpDir=\(tmpDir.path) session=\(sessionName)")
     try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
     guard browser.adapter.prepareProfileForPlaywright(from: browser.profile, at: tmpDir) else {
@@ -456,6 +461,34 @@ final class Scraper: @unchecked Sendable {
 
   private func closePlaywrightSession(_ sessionName: String) {
     _ = runPlaywrightCommand(["-s=\(sessionName)", "close"])
+  }
+
+  // The Playwright daemon is spawned detached (re-parented to launchd), and the
+  // only teardown is the in-process `defer` in scrapeChatGPT. If the app quits
+  // or crashes mid-scrape (a rebuild during development is enough), that defer
+  // never runs and a headless Firefox is orphaned forever. Run this once at
+  // launch — gated by the single-instance lock so it can't reap a live sibling's
+  // session — to close anything we left behind.
+  func reapStaleSessions() {
+    guard FileManager.default.isExecutableFile(atPath: playwrightCLI) else { return }
+    guard let output = runPlaywrightCommand(["list"]) else {
+      log.warning("reapStaleSessions: could not list Playwright sessions")
+      return
+    }
+    let stale = output.components(separatedBy: "\n").compactMap { line -> String? in
+      guard line.hasPrefix("- "), line.hasSuffix(":") else { return nil }
+      let name = String(line.dropFirst(2).dropLast())
+      return name.hasPrefix(Self.sessionPrefix) ? name : nil
+    }
+    guard !stale.isEmpty else {
+      log.info("reapStaleSessions: no stale sessions")
+      return
+    }
+    log.notice("reapStaleSessions: closing \(stale.count) orphaned session(s)")
+    for name in stale {
+      log.info("reapStaleSessions: closing \(name)")
+      closePlaywrightSession(name)
+    }
   }
 
   private func decodePlaywrightStringResult(_ output: String) -> String {
