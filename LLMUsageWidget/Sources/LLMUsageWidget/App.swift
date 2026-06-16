@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   var statusItem: NSStatusItem?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    NSApp.setActivationPolicy(.accessory)
     log.info("App did finish launching")
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = statusItem?.button {
