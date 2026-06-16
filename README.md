@@ -1,21 +1,15 @@
 # LLM Usage Widget
 
-macOS desktop app that shows Ollama and ChatGPT Codex usage at a glance.
+A macOS menu-bar widget that shows Ollama and ChatGPT Codex usage at a glance. It reuses your browser's existing login session, so there's nothing extra to authenticate.
 
-## Requirements
+## Tutorial: first run
 
-- macOS 15+
-- Swift 6 / Xcode 16+
-- `playwright-cli`
-- Playwright Firefox browser bundle for ChatGPT scraping:
+Requirements:
 
-```bash
-/opt/homebrew/bin/playwright-cli install-browser firefox
-```
+- macOS 15+, Swift 6 / Xcode 16+
+- Zen or Firefox, signed into [ollama.com](https://ollama.com)
 
-- Zen or Firefox, signed into the sites you want to monitor
-
-## Build
+Build and run:
 
 ```bash
 cd LLMUsageWidget
@@ -23,65 +17,61 @@ swift build
 swift run
 ```
 
-## Data Directory
+The widget appears in the top-right corner and refreshes every 5 minutes.
 
-The app stores runtime files in `~/.llm-usage-widget/`:
+## How-to guides
 
-- `usage.json`: last scraped usage payload
-- `include-chatgpt`: enables ChatGPT scraping when present
-
-If you previously used `~/.ollama-usage/`, the app migrates that directory automatically on startup.
-
-## Enable ChatGPT
+### Run it at login
 
 ```bash
+./install.sh
+```
+
+Builds a release binary and registers a LaunchAgent. Logs go to `/tmp/llm-widget.log`.
+Stop with `launchctl bootout gui/$(id -u)/com.llmwidget`.
+
+### Enable ChatGPT Codex usage
+
+Needs `playwright-cli` and the Playwright Firefox bundle:
+
+```bash
+playwright-cli install-browser firefox
 touch ~/.llm-usage-widget/include-chatgpt
 ```
 
-To disable it:
+Disable with `rm ~/.llm-usage-widget/include-chatgpt`.
 
-```bash
-rm ~/.llm-usage-widget/include-chatgpt
-```
+## Reference
 
-## Browser Support
+### Browser support
 
-Current support is Firefox-family only:
+Firefox-family only. The app reads cookies from a Firefox `cookies.sqlite`, so support is limited to:
 
 - Zen
 - Firefox
 
-The app:
+Chrome, Safari, Arc, and Edge are **not** supported. You must be signed into the sites in one of the supported browsers.
 
-1. Finds the first supported Firefox-family profile with cookies
-2. Reads Ollama cookies from `cookies.sqlite`
-3. Launches a Playwright Firefox session for ChatGPT analytics when enabled
-4. Polls until the ChatGPT page is actually ready instead of waiting a fixed delay
+### Data directory: `~/.llm-usage-widget/`
 
-## Preflight
+- `usage.json`: last scraped payload
+- `include-chatgpt`: presence enables ChatGPT scraping
 
-Before scraping, the app checks for the main failure conditions:
+A legacy `~/.ollama-usage/` directory is migrated automatically on startup.
 
-- supported Zen/Firefox profile not found
+### Preflight checks
+
+Before scraping, the app reports any of these in-window instead of showing "No data":
+
+- no supported Zen/Firefox profile found
 - missing `sqlite3` or `curl`
 - ChatGPT enabled without `playwright-cli`
-- ChatGPT enabled without the Playwright Firefox browser installed
+- ChatGPT enabled without the Playwright Firefox bundle
 
-If no usage data is available yet, these issues are shown in the app instead of a generic "No data."
+## Explanation: how it works
 
-## Project Structure
+**Ollama:** reads session cookies from the browser profile and fetches `ollama.com/settings` with `curl`, then parses the usage meters out of the HTML.
 
-```text
-llm-usage-widget/
-├── README.md
-└── LLMUsageWidget/
-    ├── Package.swift
-    └── Sources/LLMUsageWidget/
-        ├── App.swift
-        ├── AppPaths.swift
-        ├── BrowserAdapter.swift
-        ├── Models.swift
-        ├── Scraper.swift
-        ├── Views.swift
-        └── Window.swift
-```
+**ChatGPT:** launches a Playwright Firefox session that reuses the browser's cookies, opens the Codex analytics page, and polls until it renders before parsing.
+
+Both run locally. The only network traffic is the requests to ollama.com and chatgpt.com that your browser would make anyway.
