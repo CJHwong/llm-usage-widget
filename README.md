@@ -2,6 +2,8 @@
 
 A macOS menu-bar widget that shows Ollama and ChatGPT Codex usage at a glance. It reuses your browser's existing login session, so there's nothing extra to authenticate.
 
+![LLM Usage Widget](assets/screenshot.jpg)
+
 ## Tutorial: first run
 
 Requirements:
