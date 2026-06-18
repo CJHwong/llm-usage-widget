@@ -34,7 +34,7 @@ struct WindowAccessor: NSViewRepresentable {
       w.titleVisibility = .hidden
       w.styleMask.insert(.fullSizeContentView)
       if #available(macOS 14.0, *) { w.titlebarSeparatorStyle = .none }
-      w.isMovableByWindowBackground = false
+      w.isMovableByWindowBackground = true
       w.standardWindowButton(.closeButton)?.isHidden = true
       w.standardWindowButton(.miniaturizeButton)?.isHidden = true
       w.standardWindowButton(.zoomButton)?.isHidden = true
