@@ -1,0 +1,71 @@
+name: OllamaGauge
+options:
+  bundleIdPrefix: com.hoss.ollama-gauge
+  deploymentTarget:
+    macOS: "15.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "5"
+    DEVELOPMENT_TEAM: 3GXP3XQ69M
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  OllamaGauge:
+    type: application
+    platform: macOS
+    sources:
+      - path: App/Sources/App
+      - path: Shared/Sources/Shared
+      # Asset catalogs go in sources, not resources: xcodegen routes .xcassets
+      # through the asset catalog compiler so Assets.car + AppIcon are bundled.
+      - path: App/Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hoss.ollama-gauge
+        PRODUCT_NAME: Ollama Gauge
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Unsandboxed host: needs to read browser cookies and spawn Playwright.
+        # The App Group entitlement still lets it write the shared container.
+        ENABLE_APP_SANDBOX: NO
+    dependencies:
+      - target: OllamaGaugeWidget
+        embed: true
+        codeSign: true
+
+  OllamaGaugeWidget:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Widget/Sources/Widget
+      - path: Shared/Sources/Shared
+      # The widget gallery reads the app icon from the extension bundle on some
+      # macOS versions, so the appex carries its own AppIcon asset catalog.
+      - path: Widget/Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hoss.ollama-gauge.widget
+        PRODUCT_NAME: OllamaGaugeWidget
+        INFOPLIST_FILE: Widget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Widget/Widget.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SKIP_INSTALL: YES
+
+schemes:
+  OllamaGauge:
+    build:
+      targets:
+        OllamaGauge: all
+        OllamaGaugeWidget: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -1,4 +1,6 @@
 .playwright-cli/
 LLMUsageWidget/.build/
 LLMUsageWidget/.swiftpm/
+LLMUsageWidget/build/
+LLMUsageWidget/OllamaGauge.xcodeproj
 .DS_Store
