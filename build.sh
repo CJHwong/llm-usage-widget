@@ -74,6 +74,13 @@ PLIST_EOF
 
 launchctl bootstrap "$DOMAIN" "$PLIST"
 
+# Force WidgetKit to pick up the freshly installed extension. The cp above swaps
+# the .appex binary, but the running widget extension and chronod keep serving
+# the OLD code until they're killed, so a rebuild otherwise shows stale views.
+# Killing NotificationCenter just re-renders its UI; all three relaunch on demand.
+echo "Reloading widget (killing stale extension + chronod)..."
+killall OllamaGaugeWidget chronod NotificationCenter 2>/dev/null || true
+
 echo "Installed $APP and running at login. Logs: $LOG"
 echo "Stop:    launchctl bootout $DOMAIN/$LABEL"
 echo "Restart: launchctl kickstart -k $DOMAIN/$LABEL"
