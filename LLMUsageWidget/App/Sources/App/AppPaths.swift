@@ -3,55 +3,26 @@ import OSLog
 
 private let log = Logger(subsystem: "com.llmwidget", category: "app-paths")
 
+// Single store for host + widget: the App Group container. The host is
+// unsandboxed and the widget is sandboxed, but both can reach the group
+// container, so there's one copy of usage.json and the ChatGPT toggle and
+// nothing has to be mirrored across a home directory.
 struct AppPaths {
   let dataDir: URL
-  let legacyDataDir: URL
 
-  init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
-    dataDir = home.appendingPathComponent(".llm-usage-widget", isDirectory: true)
-    legacyDataDir = home.appendingPathComponent(".ollama-usage", isDirectory: true)
+  init() {
+    if let container = UsageDataStore.containerURL {
+      dataDir = container
+    } else {
+      // The container always resolves when the App Group entitlement is
+      // present; fall back to home so a misconfigured build still runs.
+      log.warning("No App Group container; falling back to ~/.llm-usage-widget")
+      dataDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".llm-usage-widget", isDirectory: true)
+    }
   }
 
   var usageFile: URL {
     dataDir.appendingPathComponent("usage.json")
-  }
-
-  var chatGPTToggleFile: URL {
-    dataDir.appendingPathComponent("include-chatgpt")
-  }
-
-  func migrateLegacyDataIfNeeded() {
-    let fm = FileManager.default
-    let newExists = fm.fileExists(atPath: dataDir.path)
-    let legacyExists = fm.fileExists(atPath: legacyDataDir.path)
-    log.info("migrateLegacyData: dataDir=\(self.dataDir.path) exists=\(newExists), legacyDir=\(self.legacyDataDir.path) exists=\(legacyExists)")
-
-    if !newExists, legacyExists {
-      if (try? fm.moveItem(at: legacyDataDir, to: dataDir)) != nil {
-        log.info("migrateLegacyData: moved legacy dir to data dir")
-        return
-      }
-    }
-
-    try? fm.createDirectory(at: dataDir, withIntermediateDirectories: true)
-
-    guard legacyExists else { return }
-    guard let items = try? fm.contentsOfDirectory(
-      at: legacyDataDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-    else { return }
-
-    for item in items {
-      let dst = dataDir.appendingPathComponent(item.lastPathComponent)
-      guard !fm.fileExists(atPath: dst.path) else { continue }
-      try? fm.moveItem(at: item, to: dst)
-    }
-
-    if let remaining = try? fm.contentsOfDirectory(
-      at: legacyDataDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]),
-      remaining.isEmpty
-    {
-      try? fm.removeItem(at: legacyDataDir)
-      log.info("migrateLegacyData: cleaned up empty legacy dir")
-    }
   }
 }

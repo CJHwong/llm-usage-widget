@@ -1,27 +1,25 @@
 import WidgetKit
 import SwiftUI
 
-// Sandbox-safe widget that renders cached usage from the shared App Group
-// container. The host app drives updates: it mirrors usage.json + the ChatGPT
-// flag into the container and calls WidgetCenter.reloadTimelines. The timeline
-// policy below is only a fallback for when the host hasn't pushed recently.
+// Two widgets, no runtime toggle: the family you add in Notification Center
+// decides what's shown. "Ollama" is medium (Ollama only); "Ollama + ChatGPT"
+// is large (both providers). The host scrapes ChatGPT only when the large
+// widget is installed (Scraper.isChatGPTWidgetInstalled), so adding/removing
+// a widget is the single source of truth for both display and scraping.
 //
-// Single family (.systemLarge), replicating the old floating panel's default
-// (collapsed) layout: a header, two compact ring cards per provider, a divider.
-// Widgets cannot hold tap-to-expand state, so the model breakdown is dropped;
-// tapping the widget opens ollama.com/settings via widgetURL.
-
-private let widgetKind = "OllamaGaugeWidget"
+// Both render cached usage from the shared App Group container; the host pushes
+// updates via WidgetCenter.reloadAllTimelines. The 300s timeline policy is only
+// a fallback for when the host hasn't pushed recently. Widgets can't hold
+// tap-to-expand state, so tapping opens ollama.com/settings via widgetURL.
 
 struct UsageEntry: TimelineEntry {
   let date: Date
   let usage: UsageData?
-  let chatGPTEnabled: Bool
 }
 
 struct UsageProvider: TimelineProvider {
   func placeholder(in context: Context) -> UsageEntry {
-    UsageEntry(date: Date(), usage: nil, chatGPTEnabled: false)
+    UsageEntry(date: Date(), usage: nil)
   }
 
   func getSnapshot(in context: Context, completion: @escaping (UsageEntry) -> Void) {
@@ -29,49 +27,61 @@ struct UsageProvider: TimelineProvider {
   }
 
   func getTimeline(in context: Context, completion: @escaping (Timeline<UsageEntry>) -> Void) {
-    let entry = currentEntry()
-    // Fallback refresh; the host pushes on change, so this rarely drives an update.
     let next = Date().addingTimeInterval(300)
-    completion(Timeline(entries: [entry], policy: .after(next)))
+    completion(Timeline(entries: [currentEntry()], policy: .after(next)))
   }
 
   private func currentEntry() -> UsageEntry {
-    UsageEntry(date: Date(), usage: UsageDataStore.readUsage(), chatGPTEnabled: UsageDataStore.chatGPTEnabled)
+    UsageEntry(date: Date(), usage: UsageDataStore.readUsage())
   }
 }
 
 @main
-struct OllamaGaugeWidget: Widget {
+struct OllamaGaugeBundle: WidgetBundle {
+  var body: some Widget {
+    OllamaWidget()
+    OllamaChatGPTWidget()
+  }
+}
+
+struct OllamaWidget: Widget {
   var body: some WidgetConfiguration {
-    StaticConfiguration(kind: widgetKind, provider: UsageProvider()) { entry in
-      OllamaGaugeWidgetEntryView(entry: entry)
+    StaticConfiguration(kind: WidgetKinds.ollama, provider: UsageProvider()) { entry in
+      PanelView(entry: entry, showChatGPT: false, ringSize: 54)
+        .containerBackground(for: .widget) { GlassPanelBackground() }
+        .widgetURL(URL(string: "https://ollama.com/settings"))
     }
-    .configurationDisplayName("Ollama Gauge")
+    .configurationDisplayName("Ollama")
+    .description("Ollama usage at a glance.")
+    .supportedFamilies([.systemMedium])
+  }
+}
+
+struct OllamaChatGPTWidget: Widget {
+  var body: some WidgetConfiguration {
+    StaticConfiguration(kind: WidgetKinds.ollamaChatGPT, provider: UsageProvider()) { entry in
+      PanelView(entry: entry, showChatGPT: true, ringSize: 66)
+        .containerBackground(for: .widget) { GlassPanelBackground() }
+        .widgetURL(URL(string: "https://ollama.com/settings"))
+    }
+    .configurationDisplayName("Ollama + ChatGPT")
     .description("Ollama and ChatGPT Codex usage at a glance.")
     .supportedFamilies([.systemLarge])
   }
 }
 
-struct OllamaGaugeWidgetEntryView: View {
-  let entry: UsageEntry
-
-  var body: some View {
-    PanelView(entry: entry)
-      // Replicates the old floating window: a dark translucent glass panel
-      // (GlassPanelBackground) over a transparent window. Color.clear alone let
-      // the system's default light widget material show through (pale white).
-      .containerBackground(for: .widget) { GlassPanelBackground() }
-      .widgetURL(URL(string: "https://ollama.com/settings"))
-  }
-}
-
 private struct PanelView: View {
   let entry: UsageEntry
+  let showChatGPT: Bool
+  let ringSize: CGFloat
   private var o: OllamaData? { entry.usage?.ollama }
   private var c: ChatGPTData? { entry.usage?.chatgpt }
 
+  // No manual edge padding: WidgetKit already insets content by its default
+  // 16pt content margin. The dark panel (containerBackground) fills edge to
+  // edge; only the inter-element spacing lives here.
   var body: some View {
-    VStack(spacing: 0) {
+    VStack(spacing: 10) {
       HStack {
         LlamaBadge()
         Text("Usage").font(.system(size: 13, weight: .semibold)).foregroundColor(GlassTheme.title)
@@ -82,45 +92,45 @@ private struct PanelView: View {
             .monospacedDigit().lineLimit(1)
         }
       }
-      .padding(.horizontal, 18)
-      .padding(.bottom, 12)
 
-      VStack(spacing: 12) {
-        if let o {
-          ProviderColumn(title: "Ollama", cards: [
-            (o.sessionPct, o.sessionResetsIn),
-            (o.weeklyPct, o.weeklyResetsIn),
-          ])
-        }
-        if entry.chatGPTEnabled {
-          if o != nil { SectionDivider() }
-          ProviderColumn(title: "ChatGPT", cards: [
-            (c?.fiveHourPct ?? 0, c?.resets.first ?? ""),
-            (c?.weeklyPct ?? 0, c?.resets.last ?? ""),
-          ])
-        }
-        if entry.usage == nil && !entry.chatGPTEnabled {
-          Text("No data yet").font(.system(size: 12)).foregroundColor(GlassTheme.secondaryText)
-        }
+      if let o {
+        // Ollama-only widget drops the redundant "Ollama" header (the widget is
+        // named Ollama); the combined widget keeps it to pair with "ChatGPT".
+        ProviderColumn(title: "Ollama", cards: [
+          (o.sessionPct, o.sessionResetsIn),
+          (o.weeklyPct, o.weeklyResetsIn),
+        ], ringSize: ringSize, showTitle: showChatGPT)
+      }
+      if showChatGPT {
+        if o != nil { SectionDivider() }
+        ProviderColumn(title: "ChatGPT", cards: [
+          (c?.fiveHourPct ?? 0, c?.resets.first ?? ""),
+          (c?.weeklyPct ?? 0, c?.resets.last ?? ""),
+        ], ringSize: ringSize, showTitle: true)
+      }
+      if entry.usage == nil {
+        Text("No data yet").font(.system(size: 12)).foregroundColor(GlassTheme.secondaryText)
       }
     }
-    .padding(.vertical, 14)
   }
 }
 
 private struct ProviderColumn: View {
   let title: String
   let cards: [(pct: Double, resets: String)]
+  var ringSize: CGFloat = 66
+  var showTitle: Bool = true
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      Text(title).font(.system(size: 10, weight: .medium)).foregroundColor(GlassTheme.secondaryText)
+    VStack(alignment: .leading, spacing: 8) {
+      if showTitle {
+        Text(title).font(.system(size: 12, weight: .semibold)).foregroundColor(GlassTheme.secondaryText)
+      }
       HStack(spacing: 8) {
         ForEach(cards.indices, id: \.self) { i in
-          UsageCard(pct: cards[i].pct, resets: cards[i].resets, models: [], showModels: false)
+          UsageCard(pct: cards[i].pct, resets: cards[i].resets, ringSize: ringSize)
         }
       }
     }
-    .padding(.horizontal, 18)
   }
 }

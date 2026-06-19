@@ -26,10 +26,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // because we hold the single-instance lock, so no sibling scrape is live.
     DispatchQueue.global().async { [scraper] in scraper.reapStaleSessions() }
 
-    // Mirror the ChatGPT toggle into the App Group container so the sandboxed
-    // widget can see it. Re-mirror on each load in case the user toggled it.
-    UsageDataStore.setChatGPTEnabled(FileManager.default.fileExists(atPath: scraper.chatGPTTogglePath))
-
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = statusItem?.button {
       let img = NSImage(systemSymbolName: "chart.pie.fill", accessibilityDescription: "Usage")
@@ -55,30 +51,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   @objc private func loadTick() { load() }
 
   // Scraper posts kChatGPTDone from its background thread once the Playwright
-  // scrape finishes. Mirror the updated cache and refresh the widget.
+  // scrape finishes. The scrape already wrote the container; just refresh.
   @objc private func chatGPTDone() {
-    log.info("kChatGPTDone: mirroring cache to App Group + reloading widget")
-    if let data = scraper.read() {
-      UsageDataStore.writeUsage(data)
-      WidgetCenter.shared.reloadTimelines(ofKind: WidgetKind.name)
+    log.info("kChatGPTDone: reloading widget")
+    if scraper.read() != nil {
+      WidgetCenter.shared.reloadAllTimelines()
     }
   }
 
   func load() {
     log.info("load() called")
     let scraper = self.scraper  // local Sendable capture; keeps self out of the Task
-    let chatGPTOn = FileManager.default.fileExists(atPath: scraper.chatGPTTogglePath)
-    UsageDataStore.setChatGPTEnabled(chatGPTOn)
     let preflightMessage = scraper.preflightMessage()
 
     Task {
-      if let cached = scraper.read() {
-        UsageDataStore.writeUsage(cached)
-        await MainActor.run { WidgetCenter.shared.reloadTimelines(ofKind: WidgetKind.name) }
+      if scraper.read() != nil {
+        await MainActor.run { WidgetCenter.shared.reloadAllTimelines() }
       }
-      if let fresh = await scraper.scrape() {
-        UsageDataStore.writeUsage(fresh)
-        await MainActor.run { WidgetCenter.shared.reloadTimelines(ofKind: WidgetKind.name) }
+      if await scraper.scrape() != nil {
+        await MainActor.run { WidgetCenter.shared.reloadAllTimelines() }
       } else if scraper.read() == nil {
         let msg = scraper.latestIssueMessage() ?? preflightMessage ?? "No data."
         log.warning("load(): scrape failed, no cached data. message=\(msg)")
@@ -108,10 +99,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     lockFileDescriptor = fd  // keep open to hold the lock
     return true
   }
-}
-
-enum WidgetKind {
-  static let name = "OllamaGaugeWidget"
 }
 
 @main struct OllamaGaugeApp: App {

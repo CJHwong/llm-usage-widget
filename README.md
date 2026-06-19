@@ -4,8 +4,8 @@ A macOS menu-bar app that scrapes Ollama and ChatGPT Codex usage and shows it in
 
 The app is split in two:
 
-- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `~/.llm-usage-widget/usage.json`, mirrors that into a shared App Group container, and tells the widget to reload.
-- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads the mirrored data from the App Group container and renders small / medium / large widget families.
+- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `usage.json` into a shared App Group container, and tells the widget to reload.
+- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads that same App Group container and renders the widget. The host is unsandboxed and the widget is sandboxed, but both can reach the group container, so there's one copy of the data and no mirroring.
 
 ## Tutorial: first run
 
@@ -32,7 +32,7 @@ Generates the Xcode project, builds a signed `.app` with the embedded widget int
 
 Stop with `launchctl bootout gui/$(id -u)/com.llmwidget`. Restart with `launchctl kickstart -k gui/$(id -u)/com.llmwidget`.
 
-Only one instance runs at a time (guarded by a lock in `~/.llm-usage-widget/`), so launching the app by hand while the LaunchAgent owns it is a no-op.
+Only one instance runs at a time (guarded by an `instance.lock` in the App Group container), so launching the app by hand while the LaunchAgent owns it is a no-op.
 
 ### Enable ChatGPT Codex usage
 
@@ -40,10 +40,10 @@ Needs `playwright-cli` and the Playwright Firefox bundle:
 
 ```bash
 playwright-cli install-browser firefox
-touch ~/.llm-usage-widget/include-chatgpt
+touch ~/Library/Group\ Containers/3GXP3XQ69M.com.hoss.ollama-gauge/chatgpt_enabled
 ```
 
-Disable by removing `~/.llm-usage-widget/include-chatgpt`. The host mirrors this flag into the App Group container so the sandboxed widget can see it; the next scrape picks up the change.
+Disable by removing that `chatgpt_enabled` file. Both the host (which scrapes) and the widget (which shows the section) read the same flag, so the next scrape picks up the change.
 
 ### If the widget does not appear in the gallery
 
@@ -80,13 +80,13 @@ Firefox-family only. The host reads cookies from a Firefox `cookies.sqlite`, so 
 
 Chrome, Safari, Arc, and Edge are **not** supported. You must be signed into the sites in one of the supported browsers.
 
-### Data directory: `~/.llm-usage-widget/`
+### Data directory: the App Group container
 
-- `usage.json`: last scraped payload (source of truth; the host mirrors it into the App Group container for the widget)
-- `include-chatgpt`: presence enables ChatGPT scraping
+Everything lives in `~/Library/Group Containers/3GXP3XQ69M.com.hoss.ollama-gauge/`, shared by the host and the sandboxed widget:
+
+- `usage.json`: last scraped payload
+- `chatgpt_enabled`: presence enables ChatGPT scraping (read by both host and widget)
 - `instance.lock`: single-instance flock
-
-A legacy `~/.ollama-usage/` directory is migrated automatically on startup.
 
 ### Preflight checks
 

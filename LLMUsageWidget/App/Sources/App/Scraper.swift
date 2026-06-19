@@ -1,12 +1,12 @@
 import Foundation
 import OSLog
+import WidgetKit
 
 private let log = Logger(subsystem: "com.llmwidget", category: "scraper")
 
 final class Scraper: @unchecked Sendable {
   private let paths: AppPaths
   private let dataFile: URL
-  private let chatGPTToggleFile: URL
   private let playwrightCLI: String = {
     let silicon = "/opt/homebrew/bin/playwright-cli"
     if FileManager.default.isExecutableFile(atPath: silicon) { return silicon }
@@ -17,6 +17,10 @@ final class Scraper: @unchecked Sendable {
   private let _lock = NSLock()
   private var _lastIssueMessage: String?
   private var _isScrapingChatGPT = false
+  // Whether the "Ollama + ChatGPT" widget is installed. Refreshed each scrape
+  // from WidgetCenter; gates the expensive ChatGPT Playwright scrape so there's
+  // no separate toggle file.
+  private var _chatGPTWanted = false
 
   // Namespaces every Playwright session this app opens, so the startup reaper
   // can recognize its own leftovers without touching unrelated sessions the
@@ -56,13 +60,29 @@ final class Scraper: @unchecked Sendable {
 
   init() {
     paths = AppPaths()
-    paths.migrateLegacyDataIfNeeded()
     dataFile = paths.usageFile
-    chatGPTToggleFile = paths.chatGPTToggleFile
   }
 
-  var chatGPTTogglePath: String {
-    chatGPTToggleFile.path
+  private var chatGPTWanted: Bool { _lock.withLock { _chatGPTWanted } }
+
+  // Ask WidgetKit whether the combined widget is installed. The host owns the
+  // widget extension, so this reflects what the user added in Notification
+  // Center. Returns false on failure so a query error never triggers the
+  // expensive ChatGPT scrape unexpectedly.
+  private func isChatGPTWidgetInstalled() async -> Bool {
+    await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+      WidgetCenter.shared.getCurrentConfigurations { result in
+        switch result {
+        case .success(let infos):
+          let installed = infos.contains { $0.kind == WidgetKinds.ollamaChatGPT }
+          log.info("getCurrentConfigurations: \(infos.count) widget(s); chatgpt widget installed=\(installed)")
+          cont.resume(returning: installed)
+        case .failure(let error):
+          log.warning("getCurrentConfigurations failed: \(error.localizedDescription)")
+          cont.resume(returning: false)
+        }
+      }
+    }
   }
 
   func preflightMessage() -> String? {
@@ -76,7 +96,12 @@ final class Scraper: @unchecked Sendable {
 
   func scrape() async -> UsageData? {
     log.info("scrape() started")
-    _lock.withLock { _lastIssueMessage = preflightMessage() }
+    // Refresh the widget-presence flag first so both the preflight message and
+    // the ChatGPT gate below see a current value.
+    let wantChatGPT = await isChatGPTWidgetInstalled()
+    _lock.withLock { _chatGPTWanted = wantChatGPT }
+    let preflight = preflightMessage()
+    _lock.withLock { _lastIssueMessage = preflight }
     guard let browser = BrowserRegistry.firstSupportedProfile() else {
       log.warning("No supported browser profile found")
       return nil
@@ -101,14 +126,14 @@ final class Scraper: @unchecked Sendable {
       }
     }
 
-    if FileManager.default.fileExists(atPath: chatGPTToggleFile.path) {
+    if wantChatGPT {
       let shouldScrape = _lock.withLock { () -> Bool in
         if _isScrapingChatGPT { return false }
         _isScrapingChatGPT = true
         return true
       }
       if shouldScrape {
-        log.info("ChatGPT toggle file found, starting ChatGPT scrape on background thread")
+        log.info("ChatGPT widget installed, starting ChatGPT scrape on background thread")
         DispatchQueue.global().async { [self, browser] in
           defer { self._lock.withLock { self._isScrapingChatGPT = false } }
           log.info("BG: scrapeChatGPT() called")
@@ -129,7 +154,7 @@ final class Scraper: @unchecked Sendable {
         log.info("ChatGPT scrape already in progress, skipping")
       }
     } else {
-      log.notice("ChatGPT toggle file not found at \(self.chatGPTToggleFile.path)")
+      log.notice("ChatGPT widget not installed; skipping ChatGPT scrape")
     }
     log.info("scrape() returning")
     return read()
@@ -368,12 +393,12 @@ final class Scraper: @unchecked Sendable {
     if !FileManager.default.isExecutableFile(atPath: "/usr/bin/curl") {
       issues.append("Missing required system binary: /usr/bin/curl.")
     }
-    if FileManager.default.fileExists(atPath: chatGPTToggleFile.path) {
+    if chatGPTWanted {
       if !FileManager.default.isExecutableFile(atPath: playwrightCLI) {
-        issues.append("ChatGPT scraping is enabled but playwright-cli is not installed.")
+        issues.append("The Ollama + ChatGPT widget is installed but playwright-cli is not.")
       } else if !isPlaywrightFirefoxInstalled() {
         issues.append(
-          "ChatGPT scraping is enabled but the Playwright Firefox browser is not installed. Run `playwright-cli install-browser firefox`."
+          "The Ollama + ChatGPT widget is installed but the Playwright Firefox browser is not. Run `playwright-cli install-browser firefox`."
         )
       }
     }

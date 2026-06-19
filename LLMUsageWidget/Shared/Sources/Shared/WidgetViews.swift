@@ -6,12 +6,15 @@ import SwiftUI
 // floating window is dropped; the widget navigates via widgetURL instead.
 
 enum GlassTheme {
-  static let panelFill = Color.black.opacity(0.22)
-  static let panelGlowTop = Color.white.opacity(0.16)
-  static let panelGlowMid = Color.white.opacity(0.05)
-  static let panelGlowBottom = Color.white.opacity(0.015)
-  static let panelStroke = Color.white.opacity(0.16)
-  static let panelInnerStroke = Color.white.opacity(0.05)
+  // Command-bar palette: an opaque dark-slate field with a whisper of top
+  // lift, not translucent glass. WidgetKit can't show the wallpaper through
+  // it anyway, so an opaque surface is the right call (see WIDGET_NOTES.md).
+  static let panelFill = Color(red: 0.102, green: 0.114, blue: 0.137)
+  static let panelGlowTop = Color.white.opacity(0.05)
+  static let panelGlowMid = Color.white.opacity(0.012)
+  static let panelGlowBottom = Color.clear
+  static let panelStroke = Color.white.opacity(0.08)
+  static let panelInnerStroke = Color.white.opacity(0.03)
   static let cardFill = Color.white.opacity(0.075)
   static let cardTopGlow = Color.white.opacity(0.08)
   static let cardBottomShade = Color.black.opacity(0.06)
@@ -63,9 +66,9 @@ struct GlassPanelBackground: View {
       RoundedRectangle(cornerRadius: 22, style: .continuous)
         .fill(GlassTheme.panelFill)
       LinearGradient(
-        colors: [GlassTheme.panelGlowTop, GlassTheme.panelGlowMid, GlassTheme.panelGlowBottom, .clear],
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
+        colors: [GlassTheme.panelGlowTop, GlassTheme.panelGlowMid, GlassTheme.panelGlowBottom],
+        startPoint: .top,
+        endPoint: .bottom
       )
       RoundedRectangle(cornerRadius: 22, style: .continuous)
         .stroke(GlassTheme.panelStroke, lineWidth: 0.8)
@@ -109,7 +112,6 @@ struct SectionDivider: View {
         )
       )
       .frame(height: 1)
-      .padding(.horizontal, 18)
       .padding(.vertical, 2)
   }
 }
@@ -144,7 +146,7 @@ struct RingView: View {
   let size: CGFloat
   let strokeWidth: CGFloat
 
-  init(pct: Double, color: Color, size: CGFloat = 36, strokeWidth: CGFloat = 3) {
+  init(pct: Double, color: Color, size: CGFloat = 66, strokeWidth: CGFloat = 5) {
     self.pct = pct
     self.color = color
     self.size = size
@@ -157,61 +159,30 @@ struct RingView: View {
       Circle().trim(from: 0, to: pct / 100).stroke(
         color, style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round)
       ).rotationEffect(.degrees(-90))
-      Text("\(Int(pct))%").font(.system(size: 11, weight: .bold)).foregroundColor(GlassTheme.primaryText)
+      Text("\(Int(pct))%").font(.system(size: size * 0.28, weight: .bold)).foregroundColor(GlassTheme.primaryText)
         .shadow(color: GlassTheme.textShadow, radius: 1, y: 1)
     }.frame(width: size, height: size)
   }
 }
 
-struct ModelRow: View {
-  let model: ModelUsage
-  let colors: [Color] = [.blue, .green, .orange, .red, .purple, .pink, .teal]
-  private let trackWidth: CGFloat = 60
-
-  var body: some View {
-    HStack(spacing: 6) {
-      RoundedRectangle(cornerRadius: 1.5)
-        .fill(colors[abs(model.model.hashValue % colors.count)])
-        .frame(width: max(trackWidth * CGFloat(model.pct) / 100, 2), height: 3)
-        .background(Color.white.opacity(0.12))
-        .clipShape(RoundedRectangle(cornerRadius: 1.5))
-        .frame(width: trackWidth, height: 3, alignment: .leading)
-      Text(model.model).font(.system(size: 11)).foregroundColor(GlassTheme.secondaryText).lineLimit(1)
-      Spacer(minLength: 0)
-      Text("\(model.requests)").font(.system(size: 11)).foregroundColor(GlassTheme.tertiaryText)
-        .monospacedDigit()
-    }
-  }
-}
-
-// Static (non-interactive) card: ring + reset label, optional compact model list
-// for the large widget family.
+// Static (non-interactive) card: a ring with its reset label. ringSize lets
+// the medium widget use a smaller gauge than the large one.
 struct UsageCard: View {
   let pct: Double
   let resets: String
-  let models: [ModelUsage]
-  let showModels: Bool
+  var ringSize: CGFloat = 66
   private var severity: CardSeverity { CardSeverity.from(pct: pct) }
   private var ringColor: Color {
     pct >= 80 ? .red : pct >= 50 ? .yellow : pct <= 10 ? .blue : .green
   }
 
   var body: some View {
-    VStack(spacing: 7) {
-      RingView(pct: pct, color: ringColor)
-      Text(resets).font(.system(size: 9, weight: .medium)).foregroundColor(GlassTheme.tertiaryText)
+    VStack(spacing: 6) {
+      RingView(pct: pct, color: ringColor, size: ringSize)
+      Text(resets).font(.system(size: 11, weight: .medium)).foregroundColor(GlassTheme.tertiaryText)
         .lineLimit(1)
-      if showModels && !models.isEmpty {
-        VStack(alignment: .leading, spacing: 2) {
-          ForEach(models.sorted(by: { $0.requests > $1.requests }).prefix(4)) { m in ModelRow(model: m) }
-          Text("\(models.reduce(0) { $0 + $1.requests }) requests")
-            .font(.system(size: 9)).foregroundColor(GlassTheme.tertiaryText)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-        .padding(.horizontal, 2)
-      }
     }
-    .frame(maxWidth: .infinity).padding(.vertical, 13).padding(.horizontal, 8)
+    .frame(maxWidth: .infinity).padding(.vertical, 8).padding(.horizontal, 8)
     .background(GlassCardBackground(severity: severity))
   }
 }
