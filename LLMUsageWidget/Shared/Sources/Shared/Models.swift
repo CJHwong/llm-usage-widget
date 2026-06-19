@@ -1,11 +1,24 @@
 import Foundation
 
+// Derived ChatGPT display state, computed by the host and read by both the
+// widget and the desktop panel. `on` = enabled and signed in (data present);
+// `off` = disabled in the menu bar; `unavailable` = enabled but no data yet
+// (not signed in / scrape failing).
+enum ChatGPTStatus: String, Codable {
+  case on
+  case off
+  case unavailable
+}
+
 struct UsageData: Codable {
   var ollama: OllamaData?
   var chatgpt: ChatGPTData?
+  // Optional so older usage.json without the key still decodes; nil reads as off.
+  var chatgptStatus: ChatGPTStatus?
   var lastUpdated: String = ""
   enum CodingKeys: String, CodingKey {
     case ollama, chatgpt
+    case chatgptStatus = "chatgpt_status"
     case lastUpdated = "last_updated"
   }
 }

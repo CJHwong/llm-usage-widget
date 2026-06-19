@@ -13,10 +13,15 @@ renders in full-color mode on top of a system-provided material/vibrancy surface
 clear `NSWindow` sitting directly on the desktop, so the wallpaper showed through;
 that look is structurally impossible in a widget.
 
-So the panel is an **opaque dark command-bar surface** (`GlassPanelBackground`):
+So the **widget** is an **opaque dark command-bar surface** (`GlassPanelBackground`):
 a near-black slate fill with a hairline border and a faint top lift. That's the
 right call precisely because the widget can't be transparent anyway, so there's
 nothing to gain from a low-opacity fill (which only reads as pale white).
+
+The **floating desktop panel** is the other half of the answer: it's a genuine
+clear `NSWindow` the host draws (`DesktopPanel`), so it *can* be transparent over
+the wallpaper. That's why both exist - the widget for Notification Center, the
+panel for an always-on-desktop glanceable with the transparent look.
 
 Secondary gotcha seen earlier, may resurface: the widget gallery would not show
 the app icon even though it was correctly bundled (see "Icon" caveat). Likely a
@@ -27,9 +32,13 @@ loginwindow-level icon cache that only a logout/login clears.
 Two-process design, matching the proven `context-bar` / `CodexBar` pattern:
 
 - **Host app** (`Ollama Gauge.app`, bundle id `com.hoss.ollama-gauge`,
-  unsandboxed): menu-bar accessory, no window. Runs the Scraper every 5 min,
-  writes `usage.json` into the shared App Group container, and calls
-  `WidgetCenter.shared.reloadAllTimelines()`.
+  unsandboxed): menu-bar accessory. Runs the Scraper every 5 min, writes
+  `usage.json` into the shared App Group container, and calls
+  `WidgetCenter.shared.reloadAllTimelines()`. It also draws the floating desktop
+  panel (`DesktopPanel`, an imperatively-created clear `NSWindow` in
+  `App.swift`) and owns the two menu-bar toggles. `AppDelegate` is `@MainActor`
+  so the load() Task inherits the main actor and can update the panel's
+  `PanelModel` without hopping off it.
 - **Widget extension** (`OllamaGaugeWidget.appex`, bundle id
   `com.hoss.ollama-gauge.widget`, sandboxed): reads the container and renders.
   Never scrapes.
@@ -44,9 +53,9 @@ Two-process design, matching the proven `context-bar` / `CodexBar` pattern:
   `killall OllamaGaugeWidget chronod NotificationCenter` so the freshly installed
   extension actually renders (see caveat #3). Requires `brew install xcodegen`.
 
-### Two widgets, no toggle
+### Two widgets
 
-The display surface is a `WidgetBundle` with two widgets and no runtime flag:
+The widget surface is a `WidgetBundle` with two widgets:
 
 - **"Ollama"** - `.systemMedium`, Ollama only.
 - **"Ollama + ChatGPT"** - `.systemLarge`, both providers.
@@ -54,12 +63,23 @@ The display surface is a `WidgetBundle` with two widgets and no runtime flag:
 The family added in Notification Center decides both what's shown and its size,
 so the frame always matches the content (a widget can't resize its own height).
 
-ChatGPT scraping is expensive (Playwright + Firefox) and so is gated: the host
-scrapes ChatGPT only when the combined widget is installed, checked via
-`WidgetCenter.getCurrentConfigurations` matching `WidgetKinds.ollamaChatGPT`.
-This replaces the old `include-chatgpt` toggle file - widget presence is now the
-single source of truth for both display and scraping. Confirmed that
-`getCurrentConfigurations` resolves correctly for the unsandboxed host.
+### ChatGPT control
+
+ChatGPT scraping is expensive (Playwright + Firefox), so it's gated on a single
+master switch: the **Enable ChatGPT** menu-bar item, persisted in the host's
+`UserDefaults` (`chatGPTEnabledKey`). The host scrapes ChatGPT only when it's on.
+
+The sandboxed widget can't read host `UserDefaults`, so the host computes a
+derived `ChatGPTStatus` (`on` / `off` / `unavailable`) and writes it into
+`usage.json` (`chatgpt_status`). All three surfaces read that one status:
+
+- desktop panel: shows the ChatGPT section only when `on`, else hides it (reflows);
+- large widget: `on` -> gauges, `off` -> "ChatGPT off", `unavailable` -> "Sign in to ChatGPT";
+- `unavailable` = enabled but no data (not signed in / scrape failing).
+
+(Earlier iterations gated on a `chatgpt_enabled` container file and then on
+`WidgetCenter.getCurrentConfigurations`; the menu toggle replaced both as a
+clearer master control.)
 
 Entitlements:
 - Host: `com.apple.security.application-groups` only. NO app-sandbox (Playwright
@@ -165,7 +185,8 @@ LLMUsageWidget/
   App/
     App.entitlements           application-groups (no sandbox)
     Info.plist                 host app (APPL, LSUIElement for menu-bar-only)
-    Sources/App/               Scraper, AppPaths, BrowserAdapter, App entry
+    Sources/App/               Scraper, AppPaths, BrowserAdapter, App (menu + window),
+                               DesktopPanel (floating panel + PanelModel)
     Resources/Assets.xcassets  AppIcon (multi-size mac idiom)
   Widget/
     Widget.entitlements        app-sandbox + application-groups

@@ -1,6 +1,5 @@
 import Foundation
 import OSLog
-import WidgetKit
 
 private let log = Logger(subsystem: "com.llmwidget", category: "scraper")
 
@@ -17,10 +16,6 @@ final class Scraper: @unchecked Sendable {
   private let _lock = NSLock()
   private var _lastIssueMessage: String?
   private var _isScrapingChatGPT = false
-  // Whether the "Ollama + ChatGPT" widget is installed. Refreshed each scrape
-  // from WidgetCenter; gates the expensive ChatGPT Playwright scrape so there's
-  // no separate toggle file.
-  private var _chatGPTWanted = false
 
   // Namespaces every Playwright session this app opens, so the startup reaper
   // can recognize its own leftovers without touching unrelated sessions the
@@ -63,26 +58,22 @@ final class Scraper: @unchecked Sendable {
     dataFile = paths.usageFile
   }
 
-  private var chatGPTWanted: Bool { _lock.withLock { _chatGPTWanted } }
+  // The ChatGPT master switch, set from the menu bar (host UserDefaults). The
+  // sandboxed widget never reads this; it reads the derived chatgptStatus the
+  // host writes into usage.json.
+  private var chatGPTEnabled: Bool { UserDefaults.standard.bool(forKey: chatGPTEnabledKey) }
 
-  // Ask WidgetKit whether the combined widget is installed. The host owns the
-  // widget extension, so this reflects what the user added in Notification
-  // Center. Returns false on failure so a query error never triggers the
-  // expensive ChatGPT scrape unexpectedly.
-  private func isChatGPTWidgetInstalled() async -> Bool {
-    await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-      WidgetCenter.shared.getCurrentConfigurations { result in
-        switch result {
-        case .success(let infos):
-          let installed = infos.contains { $0.kind == WidgetKinds.ollamaChatGPT }
-          log.info("getCurrentConfigurations: \(infos.count) widget(s); chatgpt widget installed=\(installed)")
-          cont.resume(returning: installed)
-        case .failure(let error):
-          log.warning("getCurrentConfigurations failed: \(error.localizedDescription)")
-          cont.resume(returning: false)
-        }
-      }
-    }
+  private func chatGPTStatus(enabled: Bool, hasData: Bool) -> ChatGPTStatus {
+    if !enabled { return .off }
+    return hasData ? .on : .unavailable
+  }
+
+  // Rewrite usage.json's chatgptStatus from the current toggle + cached data,
+  // without scraping, so a menu toggle reflects in the widget/panel immediately.
+  func refreshChatGPTStatus() {
+    guard var d = read() else { return }
+    d.chatgptStatus = chatGPTStatus(enabled: chatGPTEnabled, hasData: d.chatgpt != nil)
+    write(d)
   }
 
   func preflightMessage() -> String? {
@@ -96,10 +87,7 @@ final class Scraper: @unchecked Sendable {
 
   func scrape() async -> UsageData? {
     log.info("scrape() started")
-    // Refresh the widget-presence flag first so both the preflight message and
-    // the ChatGPT gate below see a current value.
-    let wantChatGPT = await isChatGPTWidgetInstalled()
-    _lock.withLock { _chatGPTWanted = wantChatGPT }
+    let wantChatGPT = chatGPTEnabled
     let preflight = preflightMessage()
     _lock.withLock { _lastIssueMessage = preflight }
     guard let browser = BrowserRegistry.firstSupportedProfile() else {
@@ -116,6 +104,7 @@ final class Scraper: @unchecked Sendable {
       var merged = read() ?? UsageData()
       merged.ollama = ollama
       merged.lastUpdated = fmt.string(from: Date())
+      merged.chatgptStatus = chatGPTStatus(enabled: wantChatGPT, hasData: merged.chatgpt != nil)
       write(merged)
       _lock.withLock { _lastIssueMessage = nil }
     } else {
@@ -133,7 +122,7 @@ final class Scraper: @unchecked Sendable {
         return true
       }
       if shouldScrape {
-        log.info("ChatGPT widget installed, starting ChatGPT scrape on background thread")
+        log.info("ChatGPT enabled, starting ChatGPT scrape on background thread")
         DispatchQueue.global().async { [self, browser] in
           defer { self._lock.withLock { self._isScrapingChatGPT = false } }
           log.info("BG: scrapeChatGPT() called")
@@ -141,6 +130,7 @@ final class Scraper: @unchecked Sendable {
             var d = self.read() ?? UsageData()
             d.chatgpt = c
             d.lastUpdated = fmt.string(from: Date())
+            d.chatgptStatus = .on
             self.write(d)
             log.info("BG: ChatGPT data written, posting notification")
             DispatchQueue.main.async {
@@ -148,13 +138,21 @@ final class Scraper: @unchecked Sendable {
             }
           } else {
             log.warning("BG: scrapeChatGPT() returned nil")
+            // Enabled but no data this run: mark unavailable unless we already
+            // have cached ChatGPT data to keep showing.
+            var d = self.read() ?? UsageData()
+            d.chatgptStatus = d.chatgpt != nil ? .on : .unavailable
+            self.write(d)
+            DispatchQueue.main.async {
+              NotificationCenter.default.post(name: kChatGPTDone, object: nil)
+            }
           }
         }
       } else {
         log.info("ChatGPT scrape already in progress, skipping")
       }
     } else {
-      log.notice("ChatGPT widget not installed; skipping ChatGPT scrape")
+      log.notice("ChatGPT disabled; skipping ChatGPT scrape")
     }
     log.info("scrape() returning")
     return read()
@@ -393,12 +391,12 @@ final class Scraper: @unchecked Sendable {
     if !FileManager.default.isExecutableFile(atPath: "/usr/bin/curl") {
       issues.append("Missing required system binary: /usr/bin/curl.")
     }
-    if chatGPTWanted {
+    if chatGPTEnabled {
       if !FileManager.default.isExecutableFile(atPath: playwrightCLI) {
-        issues.append("The Ollama + ChatGPT widget is installed but playwright-cli is not.")
+        issues.append("ChatGPT is enabled but playwright-cli is not installed.")
       } else if !isPlaywrightFirefoxInstalled() {
         issues.append(
-          "The Ollama + ChatGPT widget is installed but the Playwright Firefox browser is not. Run `playwright-cli install-browser firefox`."
+          "ChatGPT is enabled but the Playwright Firefox browser is not installed. Run `playwright-cli install-browser firefox`."
         )
       }
     }

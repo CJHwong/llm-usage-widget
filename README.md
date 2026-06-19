@@ -1,11 +1,13 @@
 # Ollama Gauge
 
-A macOS menu-bar app that scrapes Ollama and ChatGPT Codex usage and shows it in a real Notification Center / desktop widget. It reuses your browser's existing login session, so there's nothing extra to authenticate.
+A macOS menu-bar app that scrapes Ollama and ChatGPT Codex usage and shows it in two places: real Notification Center widgets and a floating desktop panel. It reuses your browser's existing login session, so there's nothing extra to authenticate.
 
 The app is split in two:
 
-- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `usage.json` into a shared App Group container, and tells the widget to reload.
-- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads that same App Group container and renders the widget. The host is unsandboxed and the widget is sandboxed, but both can reach the group container, so there's one copy of the data and no mirroring.
+- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `usage.json` into a shared App Group container, tells the widgets to reload, and optionally draws the floating desktop panel (transparent over the wallpaper, which a widget can't be). Its menu bar has **Show Desktop Panel** and **Enable ChatGPT** toggles.
+- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads that same App Group container and renders two widgets: **Ollama** (medium) and **Ollama + ChatGPT** (large). The host is unsandboxed and the widget is sandboxed, but both reach the group container, so there's one copy of the data and no mirroring.
+
+ChatGPT is a single master switch in the menu bar. When it's off (or you're not signed in), the desktop panel hides the ChatGPT section and the large widget shows a "ChatGPT off" / "Sign in to ChatGPT" indicator.
 
 ## Tutorial: first run
 
@@ -36,14 +38,13 @@ Only one instance runs at a time (guarded by an `instance.lock` in the App Group
 
 ### Enable ChatGPT Codex usage
 
-Needs `playwright-cli` and the Playwright Firefox bundle:
+First install the scrape prerequisites:
 
 ```bash
 playwright-cli install-browser firefox
-touch ~/Library/Group\ Containers/3GXP3XQ69M.com.hoss.ollama-gauge/chatgpt_enabled
 ```
 
-Disable by removing that `chatgpt_enabled` file. Both the host (which scrapes) and the widget (which shows the section) read the same flag, so the next scrape picks up the change.
+Then toggle **Enable ChatGPT** in the menu bar. That's the master switch: it gates the (expensive) ChatGPT scrape and drives the display everywhere. Turn it off the same way; the desktop panel and widget update on the next scrape. If you turn it on but aren't signed in to ChatGPT in your browser, the large widget shows "Sign in to ChatGPT".
 
 ### If the widget does not appear in the gallery
 
@@ -84,9 +85,10 @@ Chrome, Safari, Arc, and Edge are **not** supported. You must be signed into the
 
 Everything lives in `~/Library/Group Containers/3GXP3XQ69M.com.hoss.ollama-gauge/`, shared by the host and the sandboxed widget:
 
-- `usage.json`: last scraped payload
-- `chatgpt_enabled`: presence enables ChatGPT scraping (read by both host and widget)
+- `usage.json`: last scraped payload, including a derived `chatgpt_status` (`on` / `off` / `unavailable`) the host computes for the widget
 - `instance.lock`: single-instance flock
+
+The ChatGPT and desktop-panel toggles live in the host's `UserDefaults`, not here, since the widget only needs the derived `chatgpt_status`.
 
 ### Preflight checks
 
