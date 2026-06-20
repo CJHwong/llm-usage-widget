@@ -97,23 +97,36 @@ final class Scraper: @unchecked Sendable {
     log.info("Found browser profile: \(browser.profile.browserName) at \(browser.profile.profilePath)")
     let fmt = Self.timeFmt
 
-    if let ch = browser.adapter.cookieHeader(for: browser.profile, domains: ["ollama", "workos"]),
+    let ollamaCookies = browser.adapter.cookies(for: browser.profile, domains: ["ollama", "workos"])
+    var merged = read() ?? UsageData()
+    if let ch = cookieHeader(from: ollamaCookies),
       let ollama = await scrapeOllama(cookies: ch)
     {
       log.info("Ollama scrape succeeded")
-      var merged = read() ?? UsageData()
       merged.ollama = ollama
-      merged.lastUpdated = fmt.string(from: Date())
-      merged.chatgptStatus = chatGPTStatus(enabled: wantChatGPT, hasData: merged.chatgpt != nil)
-      write(merged)
+      merged.ollamaStatus = .on
       _lock.withLock { _lastIssueMessage = nil }
+    } else if ollamaCookies.isEmpty {
+      // Not signed in to Ollama in the selected browser: drop any stale numbers
+      // (e.g. left over from another browser) so the panel shows the truth.
+      log.warning("Ollama: no cookies in \(browser.profile.browserName)")
+      merged.ollama = nil
+      merged.ollamaStatus = .unavailable
+      _lock.withLock {
+        _lastIssueMessage = "Not signed in to Ollama in \(browser.profile.browserName)."
+      }
     } else {
-      log.warning("Ollama scrape: no cookies or parse failed")
+      // Cookies exist but the fetch/parse failed (transient): keep the last good data.
+      log.warning("Ollama scrape failed despite cookies present")
+      merged.ollamaStatus = merged.ollama != nil ? .on : .unavailable
       _lock.withLock {
         _lastIssueMessage =
-          "Could not read authenticated Ollama usage from \(browser.profile.browserName). Check that you are signed in and the profile still has the required cookies."
+          "Could not read Ollama usage from \(browser.profile.browserName). Check that you are signed in and the profile still has the required cookies."
       }
     }
+    merged.lastUpdated = fmt.string(from: Date())
+    merged.chatgptStatus = chatGPTStatus(enabled: wantChatGPT, hasData: merged.chatgpt != nil)
+    write(merged)
 
     if wantChatGPT {
       let shouldScrape = _lock.withLock { () -> Bool in
@@ -217,40 +230,57 @@ final class Scraper: @unchecked Sendable {
     log.info("scrapeChatGPT() START")
     log.info("scrapeChatGPT: using \(browser.profile.browserName) profile at \(browser.profile.profilePath)")
 
+    // Inject cookies through a Playwright storage_state instead of copying the
+    // browser profile: Chromium can't decrypt Chrome's cookie DB (different Safe
+    // Storage key), so we hand Playwright already-decrypted cookies. This works
+    // uniformly for Chrome and Firefox.
+    let cookies = browser.adapter.cookies(for: browser.profile, domains: ["chatgpt", "openai"])
+    guard let stateData = storageStateData(from: cookies) else {
+      log.warning("scrapeChatGPT: no chatgpt/openai cookies in \(browser.profile.browserName)")
+      _lock.withLock {
+        _lastIssueMessage =
+          "No ChatGPT session cookies found in \(browser.profile.browserName). Sign in to ChatGPT in that browser."
+      }
+      return nil
+    }
+
     let tmpDir = URL(fileURLWithPath: "/tmp/pwt-\(ProcessInfo.processInfo.globallyUniqueString)")
+    let stateFile = tmpDir.appendingPathComponent("state.json")
     let sessionName = "\(Self.sessionPrefix)\(ProcessInfo.processInfo.globallyUniqueString)"
     log.info("scrapeChatGPT: tmpDir=\(tmpDir.path) session=\(sessionName)")
     try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-    guard browser.adapter.prepareProfileForPlaywright(from: browser.profile, at: tmpDir) else {
-      log.error("scrapeChatGPT: prepareProfileForPlaywright failed")
+    guard (try? stateData.write(to: stateFile)) != nil else {
+      log.error("scrapeChatGPT: failed to write storage_state")
       try? FileManager.default.removeItem(at: tmpDir)
       return nil
     }
-    log.info("scrapeChatGPT: profile prepared for playwright")
-
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: playwrightCLI)
-    proc.arguments = [
-      "-s=\(sessionName)", "open", "--browser", browser.adapter.playwrightBrowserName,
-      "--persistent", "--profile", tmpDir.path,
-      "https://chatgpt.com/codex/cloud/settings/analytics",
-    ]
-    let openOut = Pipe()
-    let openErr = Pipe()
-    proc.standardOutput = openOut
-    proc.standardError = openErr
-    guard (try? proc.run()) != nil else {
-      log.error("scrapeChatGPT: failed to launch playwright process")
-      _lock.withLock { _lastIssueMessage = "Could not launch Playwright for ChatGPT." }
-      try? FileManager.default.removeItem(at: tmpDir)
-      return nil
-    }
-    log.info("scrapeChatGPT: playwright launched (PID \(proc.processIdentifier))")
     defer {
-      log.info("scrapeChatGPT: cleanup - closing session + terminating proc")
+      log.info("scrapeChatGPT: cleanup - closing session")
       closePlaywrightSession(sessionName)
-      proc.terminate()
       try? FileManager.default.removeItem(at: tmpDir)
+    }
+
+    // open a blank context, load the cookies, then navigate authenticated.
+    guard
+      runPlaywrightCommand(
+        ["-s=\(sessionName)", "open", "--browser", browser.adapter.playwrightBrowserName, "about:blank"],
+        timeout: 30) != nil
+    else {
+      log.error("scrapeChatGPT: open failed")
+      _lock.withLock { _lastIssueMessage = "Could not launch Playwright for ChatGPT." }
+      return nil
+    }
+    guard runPlaywrightCommand(["-s=\(sessionName)", "state-load", stateFile.path]) != nil else {
+      log.error("scrapeChatGPT: state-load failed")
+      return nil
+    }
+    guard
+      runPlaywrightCommand(
+        ["-s=\(sessionName)", "goto", "https://chatgpt.com/codex/cloud/settings/analytics"],
+        timeout: 30) != nil
+    else {
+      log.error("scrapeChatGPT: goto failed")
+      return nil
     }
 
     log.info("scrapeChatGPT: entering waitForChatGPTPage loop")
@@ -382,8 +412,9 @@ final class Scraper: @unchecked Sendable {
   private func preflightIssues() -> [String] {
     var issues: [String] = []
 
-    if BrowserRegistry.firstSupportedProfile() == nil {
-      issues.append("No supported Zen or Firefox profile with cookies was found.")
+    let selection = BrowserRegistry.firstSupportedProfile()
+    if selection == nil {
+      issues.append("No supported Zen, Firefox, or Chrome profile with cookies was found.")
     }
     if !FileManager.default.isExecutableFile(atPath: "/usr/bin/sqlite3") {
       issues.append("Missing required system binary: /usr/bin/sqlite3.")
@@ -394,7 +425,10 @@ final class Scraper: @unchecked Sendable {
     if chatGPTEnabled {
       if !FileManager.default.isExecutableFile(atPath: playwrightCLI) {
         issues.append("ChatGPT is enabled but playwright-cli is not installed.")
-      } else if !isPlaywrightFirefoxInstalled() {
+      } else if selection?.adapter.playwrightBrowserName == "firefox", !isPlaywrightFirefoxInstalled()
+      {
+        // The Chrome channel uses the installed Google Chrome, so only the
+        // Firefox path needs Playwright's bundled browser.
         issues.append(
           "ChatGPT is enabled but the Playwright Firefox browser is not installed. Run `playwright-cli install-browser firefox`."
         )
@@ -449,7 +483,7 @@ final class Scraper: @unchecked Sendable {
     body.contains("Resets") && body.contains("%")
   }
 
-  private func runPlaywrightCommand(_ arguments: [String]) -> String? {
+  private func runPlaywrightCommand(_ arguments: [String], timeout: TimeInterval = 10) -> String? {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: playwrightCLI)
     proc.arguments = arguments
@@ -464,7 +498,7 @@ final class Scraper: @unchecked Sendable {
       log.error("runPlaywrightCommand: failed to launch playwright process")
       return nil
     }
-    if sem.wait(timeout: .now() + 10) == .timedOut {
+    if sem.wait(timeout: .now() + timeout) == .timedOut {
       proc.terminate()
       log.error("runPlaywrightCommand: timed out after 10s, args=\(arguments.joined(separator: " "))")
       return nil

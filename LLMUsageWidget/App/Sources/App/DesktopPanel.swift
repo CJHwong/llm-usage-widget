@@ -253,9 +253,35 @@ private struct DeskProviderSection: View {
   }
 }
 
+// Stands in for a provider section when the selected browser isn't signed in.
+// Same header-as-link affordance as DeskProviderSection so it reads as the same
+// kind of block, just empty with a reason.
+private struct DeskSignInSection: View {
+  let title: String
+  let message: String
+  let url: String
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Button(action: { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }) {
+        Text(title).font(.system(size: 10, weight: .medium)).foregroundColor(DeskTheme.secondaryText)
+      }.buttonStyle(.plain)
+      Button(action: { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }) {
+        Text(message).font(.system(size: 11, weight: .medium)).foregroundColor(DeskTheme.tertiaryText)
+          .frame(maxWidth: .infinity).padding(.vertical, 18)
+          .background(DeskCardBackground(severity: .low, isExpanded: false))
+      }.buttonStyle(.plain)
+    }
+    .padding(.horizontal, 18)
+  }
+}
+
 struct DesktopPanel: View {
   @ObservedObject var model: PanelModel
   private var chatGPTShown: Bool { model.usage?.chatgptStatus == .on }
+  private var ollamaSignedIn: Bool { model.usage?.resolvedOllamaStatus == .on }
+  // Master switch on but no session yet: prompt to sign in (off stays hidden).
+  private var chatGPTNeedsSignIn: Bool { model.usage?.chatgptStatus == .unavailable }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -289,25 +315,30 @@ struct DesktopPanel: View {
         Spacer()
       } else {
         VStack(spacing: 12) {
-          if let o = model.usage?.ollama {
+          if let o = model.usage?.ollama, ollamaSignedIn {
             DeskProviderSection(
               title: "Ollama", url: "https://ollama.com/settings",
               cards: [
                 (o.sessionPct, o.sessionResetsIn, o.sessionModels),
                 (o.weeklyPct, o.weeklyResetsIn, o.weeklyModels),
               ])
+          } else {
+            DeskSignInSection(
+              title: "Ollama", message: "Sign in to Ollama", url: "https://ollama.com/settings")
           }
           if chatGPTShown {
-            if model.usage?.ollama != nil { DeskDivider() }
+            DeskDivider()
             DeskProviderSection(
               title: "ChatGPT", url: "https://chatgpt.com/codex/cloud/settings/analytics",
               cards: [
                 (model.usage?.chatgpt?.fiveHourPct ?? 0, model.usage?.chatgpt?.resets.first ?? "", []),
                 (model.usage?.chatgpt?.weeklyPct ?? 0, model.usage?.chatgpt?.resets.last ?? "", []),
               ])
-          }
-          if model.usage == nil && !chatGPTShown {
-            Text("No data yet").font(.system(size: 12)).foregroundColor(DeskTheme.secondaryText)
+          } else if chatGPTNeedsSignIn {
+            DeskDivider()
+            DeskSignInSection(
+              title: "ChatGPT", message: "Sign in to ChatGPT",
+              url: "https://chatgpt.com/codex/cloud/settings/analytics")
           }
         }
       }

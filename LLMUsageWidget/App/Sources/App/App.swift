@@ -10,6 +10,10 @@ private let log = Logger(subsystem: "com.llmwidget", category: "app")
 // scraper writes into usage.json).
 let chatGPTEnabledKey = "chatGPTEnabled"
 let showDesktopPanelKey = "showDesktopPanel"
+// Which browser to read cookies from. "Automatic" means the first detected
+// browser in registry order; a specific name pins the source to that browser.
+let preferredBrowserKey = "preferredBrowser"
+let automaticBrowserValue = "Automatic"
 
 // Menu-bar host: scrapes Ollama + ChatGPT usage every 5 min, feeds the widget
 // via the App Group container, and (optionally) shows the floating desktop
@@ -32,7 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       NSApp.terminate(nil)
       return
     }
-    UserDefaults.standard.register(defaults: [showDesktopPanelKey: true, chatGPTEnabledKey: false])
+    UserDefaults.standard.register(defaults: [
+      showDesktopPanelKey: true, chatGPTEnabledKey: false,
+      preferredBrowserKey: automaticBrowserValue,
+    ])
     log.info("App did finish launching")
     // Reap orphaned Playwright sessions left by a previous crash/quit. Safe here
     // because we hold the single-instance lock, so no sibling scrape is live.
@@ -71,10 +78,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     chatGPTItem.state = UserDefaults.standard.bool(forKey: chatGPTEnabledKey) ? .on : .off
     menu.addItem(chatGPTItem)
 
+    let browserItem = NSMenuItem(title: "Browser", action: nil, keyEquivalent: "")
+    browserItem.submenu = buildBrowserMenu()
+    menu.addItem(browserItem)
+
     menu.addItem(.separator())
     menu.addItem(
       NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     statusItem?.menu = menu
+  }
+
+  private func buildBrowserMenu() -> NSMenu {
+    let menu = NSMenu()
+    let current = UserDefaults.standard.string(forKey: preferredBrowserKey) ?? automaticBrowserValue
+    for name in [automaticBrowserValue] + BrowserRegistry.availableBrowserNames() {
+      let item = NSMenuItem(title: name, action: #selector(selectBrowser(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = name
+      item.state = current == name ? .on : .off
+      menu.addItem(item)
+    }
+    return menu
+  }
+
+  @objc private func selectBrowser(_ sender: NSMenuItem) {
+    guard let value = sender.representedObject as? String else { return }
+    UserDefaults.standard.set(value, forKey: preferredBrowserKey)
+    for item in sender.menu?.items ?? [] {
+      item.state = (item.representedObject as? String) == value ? .on : .off
+    }
+    load()  // re-scrape from the newly selected browser
   }
 
   @objc private func toggleDesktopPanel(_ sender: NSMenuItem) {

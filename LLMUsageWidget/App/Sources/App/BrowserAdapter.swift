@@ -8,11 +8,25 @@ struct BrowserProfile {
   let profilePath: String
 }
 
+// One decrypted cookie, browser-agnostic. Feeds both the curl "Cookie:" header
+// (Ollama path) and the Playwright storage_state (ChatGPT path), so each browser
+// only has to know how to read its own store — not how the cookies get used.
+struct BrowserCookie: Sendable {
+  let domain: String
+  let name: String
+  let value: String
+  let path: String
+  let expires: Double  // unix seconds; -1 for a session cookie
+  let isSecure: Bool
+  let isHTTPOnly: Bool
+  let sameSite: String  // "Strict" | "Lax" | "None"
+}
+
 protocol BrowserAdapter: Sendable {
+  var browserName: String { get }
   var playwrightBrowserName: String { get }
   func findProfile() -> BrowserProfile?
-  func cookieHeader(for profile: BrowserProfile, domains: [String]) -> String?
-  func prepareProfileForPlaywright(from profile: BrowserProfile, at tmpDir: URL) -> Bool
+  func cookies(for profile: BrowserProfile, domains: [String]) -> [BrowserCookie]
 }
 
 struct BrowserSelection {
@@ -20,22 +34,105 @@ struct BrowserSelection {
   let profile: BrowserProfile
 }
 
+// Curl-ready "Cookie:" header value.
+func cookieHeader(from cookies: [BrowserCookie]) -> String? {
+  cookies.isEmpty ? nil : cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+}
+
+// Playwright storage_state document for `state-load`. Playwright rejects a
+// SameSite=None cookie that isn't Secure, so downgrade those to Lax.
+func storageStateData(from cookies: [BrowserCookie]) -> Data? {
+  guard !cookies.isEmpty else { return nil }
+  let entries: [[String: Any]] = cookies.map { cookie in
+    let sameSite = (cookie.sameSite == "None" && !cookie.isSecure) ? "Lax" : cookie.sameSite
+    return [
+      "name": cookie.name, "value": cookie.value, "domain": cookie.domain,
+      "path": cookie.path, "expires": cookie.expires, "httpOnly": cookie.isHTTPOnly,
+      "secure": cookie.isSecure, "sameSite": sameSite,
+    ]
+  }
+  return try? JSONSerialization.data(withJSONObject: ["cookies": entries, "origins": []])
+}
+
+// SQL `OR` of substring matches against a host column, e.g. host LIKE '%ollama%'.
+func domainFilter(_ domains: [String], column: String) -> String {
+  domains.map { domain in
+    let escaped = domain.replacingOccurrences(of: "'", with: "''")
+    return "\(column) LIKE '%\(escaped)%'"
+  }.joined(separator: " OR ")
+}
+
+// Reads a (possibly locked) browser cookie DB by copying it to /tmp first, then
+// runs the query with ASCII unit/record separators so cookie values containing
+// '|' or newlines don't corrupt the row split.
+enum SQLiteReader {
+  static func rows(dbPath: String, query: String) -> [[String]]? {
+    let tmp = "/tmp/occ-\(ProcessInfo.processInfo.globallyUniqueString).sqlite"
+    guard (try? FileManager.default.copyItem(atPath: dbPath, toPath: tmp)) != nil else {
+      log.error("SQLiteReader: failed to copy \(dbPath)")
+      return nil
+    }
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    proc.arguments = ["-separator", "\u{1f}", "-newline", "\u{1e}", tmp, query]
+    let out = Pipe()
+    proc.standardOutput = out
+    proc.standardError = Pipe()
+    guard (try? proc.run()) != nil else {
+      log.error("SQLiteReader: sqlite3 launch failed")
+      return nil
+    }
+    proc.waitUntilExit()
+    guard proc.terminationStatus == 0 else {
+      log.warning("SQLiteReader: sqlite3 exit code \(proc.terminationStatus)")
+      return nil
+    }
+    guard let raw = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    else {
+      log.warning("SQLiteReader: output not UTF-8")
+      return nil
+    }
+    return raw.split(separator: "\u{1e}", omittingEmptySubsequences: true).map {
+      $0.components(separatedBy: "\u{1f}")
+    }
+  }
+}
+
 enum BrowserRegistry {
+  // Returns the cookie source. With no preference (or "Automatic") it's the
+  // first browser found in adapter order; otherwise the named browser only.
   static func firstSupportedProfile() -> BrowserSelection? {
-    firefoxFamilyAdapters.compactMap { adapter in
+    let preferred = UserDefaults.standard.string(forKey: preferredBrowserKey)
+    let pool = adapters.filter { adapter in
+      preferred == nil || preferred == automaticBrowserValue || adapter.browserName == preferred
+    }
+    return pool.lazy.compactMap { adapter in
       adapter.findProfile().map { BrowserSelection(adapter: adapter, profile: $0) }
     }.first
   }
 
-  private static var firefoxFamilyAdapters: [FirefoxFamilyBrowserAdapter] {
+  // Browser names that currently have a usable profile, for the menu picker.
+  static func availableBrowserNames() -> [String] {
+    adapters.compactMap { $0.findProfile() != nil ? $0.browserName : nil }
+  }
+
+  private static var adapters: [any BrowserAdapter] {
     let home = FileManager.default.homeDirectoryForCurrentUser
     return [
-      FirefoxFamilyBrowserAdapter(
-        browserName: "Zen",
-        applicationSupportDir: home.appendingPathComponent("Library/Application Support/zen")),
+      ChromiumFamilyBrowserAdapter(
+        browserName: "Chrome",
+        applicationSupportDir: home.appendingPathComponent(
+          "Library/Application Support/Google/Chrome"),
+        playwrightBrowserName: "chrome",
+        keychainService: "Chrome Safe Storage"),
       FirefoxFamilyBrowserAdapter(
         browserName: "Firefox",
         applicationSupportDir: home.appendingPathComponent("Library/Application Support/Firefox")),
+      FirefoxFamilyBrowserAdapter(
+        browserName: "Zen",
+        applicationSupportDir: home.appendingPathComponent("Library/Application Support/zen")),
     ]
   }
 }
@@ -59,58 +156,36 @@ struct FirefoxFamilyBrowserAdapter: BrowserAdapter {
     return BrowserProfile(browserName: browserName, profilePath: profilePath)
   }
 
-  func cookieHeader(for profile: BrowserProfile, domains: [String]) -> String? {
-    log.info("cookieHeader: reading cookies for \(profile.browserName) profile, domains=\(domains)")
+  // Firefox stores cookies in plaintext, so this is a straight read of moz_cookies.
+  func cookies(for profile: BrowserProfile, domains: [String]) -> [BrowserCookie] {
+    log.info("cookies: reading \(profile.browserName) cookies, domains=\(domains)")
     let src = (profile.profilePath as NSString).appendingPathComponent("cookies.sqlite")
-    let tmp = "/tmp/occ-\(ProcessInfo.processInfo.globallyUniqueString).sqlite"
-    guard (try? FileManager.default.copyItem(atPath: src, toPath: tmp)) != nil else {
-      log.error("cookieHeader: failed to copy cookies.sqlite from \(src)")
-      return nil
-    }
-    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let query =
+      "SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite "
+      + "FROM moz_cookies WHERE \(domainFilter(domains, column: "host"))"
+    guard let rows = SQLiteReader.rows(dbPath: src, query: query) else { return [] }
 
-    let filters = domains.map { domain in
-      let escaped = domain.replacingOccurrences(of: "'", with: "''")
-      return "host LIKE '%\(escaped)%'"
-    }.joined(separator: " OR ")
-
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-    proc.arguments = [tmp, "SELECT host, name, value FROM moz_cookies WHERE \(filters);"]
-
-    let out = Pipe()
-    proc.standardOutput = out
-    proc.standardError = Pipe()
-    guard (try? proc.run()) != nil else {
-      log.error("cookieHeader: sqlite3 launch failed")
-      return nil
+    let parsed = rows.compactMap { columns -> BrowserCookie? in
+      guard columns.count >= 8 else { return nil }
+      let expiry = Double(columns[4]) ?? 0
+      return BrowserCookie(
+        domain: columns[0], name: columns[1], value: columns[2],
+        path: columns[3].isEmpty ? "/" : columns[3],
+        expires: expiry == 0 ? -1 : expiry,
+        isSecure: columns[5] == "1", isHTTPOnly: columns[6] == "1",
+        sameSite: Self.sameSite(columns[7]))
     }
-    proc.waitUntilExit()
-    guard proc.terminationStatus == 0 else {
-      log.warning("cookieHeader: sqlite3 exit code \(proc.terminationStatus)")
-      return nil
-    }
-    guard let raw = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-    else {
-      log.warning("cookieHeader: sqlite3 output not UTF-8")
-      return nil
-    }
-
-    var parts: [String] = []
-    for line in raw.components(separatedBy: "\n") where !line.isEmpty {
-      let columns = line.components(separatedBy: "|")
-      if columns.count >= 3 {
-        parts.append("\(columns[1])=\(columns[2])")
-      }
-    }
-    log.info("cookieHeader: found \(parts.count) cookies for \(domains)")
-    return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    log.info("cookies: parsed \(parsed.count) cookies for \(domains)")
+    return parsed
   }
 
-  func prepareProfileForPlaywright(from profile: BrowserProfile, at tmpDir: URL) -> Bool {
-    let cookieSrc = (profile.profilePath as NSString).appendingPathComponent("cookies.sqlite")
-    let cookieDst = tmpDir.appendingPathComponent("cookies.sqlite").path
-    return (try? FileManager.default.copyItem(atPath: cookieSrc, toPath: cookieDst)) != nil
+  // Firefox sameSite enum: 0 unset/none, 1 lax, 2 strict.
+  private static func sameSite(_ raw: String) -> String {
+    switch raw {
+    case "2": return "Strict"
+    case "0": return "None"
+    default: return "Lax"
+    }
   }
 
   private func profilePathFromINI() -> String? {
@@ -127,13 +202,16 @@ struct FirefoxFamilyBrowserAdapter: BrowserAdapter {
     let defaultProfile = parser.sections
       .filter { $0.name.hasPrefix("Profile") }
       .first { $0.values["Default"] == "1" }
-      .flatMap { resolveProfilePath(path: $0.values["Path"], isRelative: $0.values["IsRelative"] == "1") }
+      .flatMap {
+        resolveProfilePath(path: $0.values["Path"], isRelative: $0.values["IsRelative"] == "1")
+      }
     if let defaultProfile, hasCookies(at: defaultProfile) { return defaultProfile }
 
     let namedProfiles = parser.sections
       .filter { $0.name.hasPrefix("Profile") }
       .compactMap { section in
-        resolveProfilePath(path: section.values["Path"], isRelative: section.values["IsRelative"] == "1")
+        resolveProfilePath(
+          path: section.values["Path"], isRelative: section.values["IsRelative"] == "1")
       }
     for candidate in namedProfiles where hasCookies(at: candidate) {
       return candidate

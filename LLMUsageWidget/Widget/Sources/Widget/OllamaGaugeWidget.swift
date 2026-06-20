@@ -93,16 +93,24 @@ private struct PanelView: View {
         }
       }
 
-      if let o {
-        // Ollama-only widget drops the redundant "Ollama" header (the widget is
-        // named Ollama); the combined widget keeps it to pair with "ChatGPT".
-        ProviderColumn(title: "Ollama", cards: [
-          (o.sessionPct, o.sessionResetsIn),
-          (o.weeklyPct, o.weeklyResetsIn),
-        ], ringSize: ringSize, showTitle: showChatGPT)
+      if let usage = entry.usage {
+        switch usage.resolvedOllamaStatus {
+        case .on:
+          if let o {
+            // Ollama-only widget drops the redundant "Ollama" header (the widget
+            // is named Ollama); the combined widget keeps it to pair "ChatGPT".
+            ProviderColumn(title: "Ollama", cards: [
+              (o.sessionPct, o.sessionResetsIn),
+              (o.weeklyPct, o.weeklyResetsIn),
+            ], ringSize: ringSize, showTitle: showChatGPT)
+          }
+        case .unavailable:
+          ProviderIndicator(
+            title: "Ollama", message: "Sign in to Ollama", ringSize: ringSize, showTitle: showChatGPT)
+        }
       }
       if showChatGPT {
-        if o != nil { SectionDivider() }
+        SectionDivider()
         switch entry.usage?.chatgptStatus ?? .off {
         case .on:
           ProviderColumn(title: "ChatGPT", cards: [
@@ -110,9 +118,9 @@ private struct PanelView: View {
             (c?.weeklyPct ?? 0, c?.resets.last ?? ""),
           ], ringSize: ringSize, showTitle: true)
         case .off:
-          ChatGPTIndicator(message: "ChatGPT off", ringSize: ringSize)
+          ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
         case .unavailable:
-          ChatGPTIndicator(message: "Sign in to ChatGPT", ringSize: ringSize)
+          ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
         }
       }
       if entry.usage == nil {
@@ -142,16 +150,20 @@ private struct ProviderColumn: View {
   }
 }
 
-// Shown in the large widget's ChatGPT slot when it's off or not signed in. A
-// fixed-size widget can't reflow away the section, so it says why it's empty.
-// Heights roughly match a gauge row so toggling doesn't jump the layout.
-private struct ChatGPTIndicator: View {
+// Stands in for a provider slot when it's off or not signed in. A fixed-size
+// widget can't reflow away the section, so it says why it's empty. Heights
+// roughly match a gauge row so toggling doesn't jump the layout.
+private struct ProviderIndicator: View {
+  let title: String
   let message: String
   let ringSize: CGFloat
+  var showTitle: Bool = true
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      Text("ChatGPT").font(.system(size: 12, weight: .semibold)).foregroundColor(GlassTheme.secondaryText)
+      if showTitle {
+        Text(title).font(.system(size: 12, weight: .semibold)).foregroundColor(GlassTheme.secondaryText)
+      }
       Text(message)
         .font(.system(size: 13, weight: .medium))
         .foregroundColor(GlassTheme.tertiaryText)

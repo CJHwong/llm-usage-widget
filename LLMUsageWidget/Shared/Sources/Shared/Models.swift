@@ -10,16 +10,31 @@ enum ChatGPTStatus: String, Codable {
   case unavailable
 }
 
+// Derived Ollama display state. `on` = signed in (data present); `unavailable`
+// = the selected browser has no Ollama session. No master toggle, so no `off`.
+enum OllamaStatus: String, Codable {
+  case on
+  case unavailable
+}
+
 struct UsageData: Codable {
   var ollama: OllamaData?
   var chatgpt: ChatGPTData?
   // Optional so older usage.json without the key still decodes; nil reads as off.
   var chatgptStatus: ChatGPTStatus?
+  // Optional for the same reason; a nil value is resolved from `ollama` below.
+  var ollamaStatus: OllamaStatus?
   var lastUpdated: String = ""
   enum CodingKeys: String, CodingKey {
     case ollama, chatgpt
     case chatgptStatus = "chatgpt_status"
+    case ollamaStatus = "ollama_status"
     case lastUpdated = "last_updated"
+  }
+
+  // Defaults a nil status (old payloads) from whether data is present.
+  var resolvedOllamaStatus: OllamaStatus {
+    ollamaStatus ?? (ollama != nil ? .on : .unavailable)
   }
 }
 
