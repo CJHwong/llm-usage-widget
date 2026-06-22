@@ -114,8 +114,8 @@ private struct PanelView: View {
         switch entry.usage?.chatgptStatus ?? .off {
         case .on:
           ProviderColumn(title: "ChatGPT", cards: [
-            (c?.fiveHourPct ?? 0, c?.resets.first ?? ""),
-            (c?.weeklyPct ?? 0, c?.resets.last ?? ""),
+            (c?.fiveHourPct ?? 0, c?.fiveHourReset ?? ""),
+            (c?.weeklyPct ?? 0, c?.weeklyReset ?? ""),
           ], ringSize: ringSize, showTitle: true)
         case .off:
           ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)

@@ -331,8 +331,8 @@ struct DesktopPanel: View {
             DeskProviderSection(
               title: "ChatGPT", url: "https://chatgpt.com/codex/cloud/settings/analytics",
               cards: [
-                (model.usage?.chatgpt?.fiveHourPct ?? 0, model.usage?.chatgpt?.resets.first ?? "", []),
-                (model.usage?.chatgpt?.weeklyPct ?? 0, model.usage?.chatgpt?.resets.last ?? "", []),
+                (model.usage?.chatgpt?.fiveHourPct ?? 0, model.usage?.chatgpt?.fiveHourReset ?? "", []),
+                (model.usage?.chatgpt?.weeklyPct ?? 0, model.usage?.chatgpt?.weeklyReset ?? "", []),
               ])
           } else if chatGPTNeedsSignIn {
             DeskDivider()

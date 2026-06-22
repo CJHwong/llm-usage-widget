@@ -139,26 +139,27 @@ final class Scraper: @unchecked Sendable {
         DispatchQueue.global().async { [self, browser] in
           defer { self._lock.withLock { self._isScrapingChatGPT = false } }
           log.info("BG: scrapeChatGPT() called")
-          if let c = self.scrapeChatGPT(using: browser) {
-            var d = self.read() ?? UsageData()
+          var d = self.read() ?? UsageData()
+          switch self.scrapeChatGPT(using: browser) {
+          case .success(let c):
             d.chatgpt = c
             d.lastUpdated = fmt.string(from: Date())
             d.chatgptStatus = .on
-            self.write(d)
             log.info("BG: ChatGPT data written, posting notification")
-            DispatchQueue.main.async {
-              NotificationCenter.default.post(name: kChatGPTDone, object: nil)
-            }
-          } else {
-            log.warning("BG: scrapeChatGPT() returned nil")
-            // Enabled but no data this run: mark unavailable unless we already
-            // have cached ChatGPT data to keep showing.
-            var d = self.read() ?? UsageData()
+          case .notSignedIn:
+            // Definitive logout: drop stale numbers and surface the sign-in
+            // prompt instead of freezing on the last good data.
+            log.warning("BG: ChatGPT not signed in")
+            d.chatgpt = nil
+            d.chatgptStatus = .unavailable
+          case .transientFailure:
+            // Fetch/parse hiccup: keep the last good data if we have any.
+            log.warning("BG: ChatGPT scrape failed (transient)")
             d.chatgptStatus = d.chatgpt != nil ? .on : .unavailable
-            self.write(d)
-            DispatchQueue.main.async {
-              NotificationCenter.default.post(name: kChatGPTDone, object: nil)
-            }
+          }
+          self.write(d)
+          DispatchQueue.main.async {
+            NotificationCenter.default.post(name: kChatGPTDone, object: nil)
           }
         }
       } else {
@@ -226,7 +227,16 @@ final class Scraper: @unchecked Sendable {
     )
   }
 
-  private func scrapeChatGPT(using browser: BrowserSelection) -> ChatGPTData? {
+  // Outcome of a ChatGPT scrape. `notSignedIn` is a definitive auth failure that
+  // should clear stale data; `transientFailure` is a hiccup worth keeping the
+  // last good data for.
+  private enum ChatGPTScrapeOutcome {
+    case success(ChatGPTData)
+    case notSignedIn
+    case transientFailure
+  }
+
+  private func scrapeChatGPT(using browser: BrowserSelection) -> ChatGPTScrapeOutcome {
     log.info("scrapeChatGPT() START")
     log.info("scrapeChatGPT: using \(browser.profile.browserName) profile at \(browser.profile.profilePath)")
 
@@ -241,7 +251,7 @@ final class Scraper: @unchecked Sendable {
         _lastIssueMessage =
           "No ChatGPT session cookies found in \(browser.profile.browserName). Sign in to ChatGPT in that browser."
       }
-      return nil
+      return .notSignedIn
     }
 
     let tmpDir = URL(fileURLWithPath: "/tmp/pwt-\(ProcessInfo.processInfo.globallyUniqueString)")
@@ -252,7 +262,7 @@ final class Scraper: @unchecked Sendable {
     guard (try? stateData.write(to: stateFile)) != nil else {
       log.error("scrapeChatGPT: failed to write storage_state")
       try? FileManager.default.removeItem(at: tmpDir)
-      return nil
+      return .transientFailure
     }
     defer {
       log.info("scrapeChatGPT: cleanup - closing session")
@@ -268,11 +278,11 @@ final class Scraper: @unchecked Sendable {
     else {
       log.error("scrapeChatGPT: open failed")
       _lock.withLock { _lastIssueMessage = "Could not launch Playwright for ChatGPT." }
-      return nil
+      return .transientFailure
     }
     guard runPlaywrightCommand(["-s=\(sessionName)", "state-load", stateFile.path]) != nil else {
       log.error("scrapeChatGPT: state-load failed")
-      return nil
+      return .transientFailure
     }
     guard
       runPlaywrightCommand(
@@ -280,29 +290,36 @@ final class Scraper: @unchecked Sendable {
         timeout: 30) != nil
     else {
       log.error("scrapeChatGPT: goto failed")
-      return nil
+      return .transientFailure
     }
 
     log.info("scrapeChatGPT: entering waitForChatGPTPage loop")
-    guard let body = waitForChatGPTPage(sessionName: sessionName) else {
-      log.warning("scrapeChatGPT: waitForChatGPTPage returned nil")
+    let body: String
+    switch waitForChatGPTPage(sessionName: sessionName) {
+    case .ready(let pageBody):
+      body = pageBody
+    case .notSignedIn:
+      log.warning("scrapeChatGPT: not signed in")
+      return .notSignedIn
+    case .unavailable:
+      log.warning("scrapeChatGPT: analytics page never became ready")
       if _lock.withLock({ _lastIssueMessage }) == nil {
         _lock.withLock {
           _lastIssueMessage =
             "ChatGPT opened but the analytics page never became ready. Check that you are signed in and still have access to Codex analytics."
         }
       }
-      return nil
+      return .transientFailure
     }
     log.info("scrapeChatGPT: page body received, length=\(body.count)")
     log.debug("scrapeChatGPT: body preview=\(body.prefix(500))")
 
     guard let parsed = parseChatGPTText(body) else {
       log.warning("scrapeChatGPT: parseChatGPTText returned nil")
-      return nil
+      return .transientFailure
     }
     log.info("scrapeChatGPT: parsed successfully - 5h=\(parsed.fiveHourPct)% weekly=\(parsed.weeklyPct)% resets=\(parsed.resets)")
-    return parsed
+    return .success(parsed)
   }
 
   private func parseChatGPTText(_ text: String) -> ChatGPTData? {
@@ -438,7 +455,15 @@ final class Scraper: @unchecked Sendable {
     return issues
   }
 
-  private func waitForChatGPTPage(sessionName: String) -> String? {
+  // What the analytics-page poll landed on: ready with body, a definitive
+  // logged-out page, or no usable page within the deadline.
+  private enum ChatGPTPageState {
+    case ready(String)
+    case notSignedIn
+    case unavailable
+  }
+
+  private func waitForChatGPTPage(sessionName: String) -> ChatGPTPageState {
     let deadline = Date().addingTimeInterval(30)
     log.info("waitForChatGPTPage: polling for up to 30s, session=\(sessionName)")
     var attempt = 0
@@ -455,7 +480,7 @@ final class Scraper: @unchecked Sendable {
       ]) else {
         log.error("waitForChatGPTPage: runPlaywrightCommand returned nil at attempt \(attempt)")
         _lock.withLock { _lastIssueMessage = "Could not read the ChatGPT page from Playwright." }
-        return nil
+        return .unavailable
       }
 
       let body = decodePlaywrightStringResult(output)
@@ -464,19 +489,19 @@ final class Scraper: @unchecked Sendable {
 
       if isChatGPTAnalyticsPageReady(body) {
         log.info("waitForChatGPTPage: analytics page ready at attempt \(attempt)")
-        return body
+        return .ready(body)
       }
       if body.lowercased().contains("log in") || body.lowercased().contains("sign up") {
         log.warning("waitForChatGPTPage: login page detected at attempt \(attempt)")
         _lock.withLock { _lastIssueMessage = "ChatGPT needs an active signed-in session in the selected browser." }
-        return nil
+        return .notSignedIn
       }
       log.info("waitForChatGPTPage: not ready yet, sleeping 1s")
       Thread.sleep(forTimeInterval: 1)
     }
 
     log.warning("waitForChatGPTPage: timed out after \(attempt) attempts")
-    return nil
+    return .unavailable
   }
 
   private func isChatGPTAnalyticsPageReady(_ body: String) -> Bool {
