@@ -245,11 +245,16 @@ final class Scraper: @unchecked Sendable {
     // Storage key), so we hand Playwright already-decrypted cookies. This works
     // uniformly for Chrome and Firefox.
     let cookies = browser.adapter.cookies(for: browser.profile, domains: ["chatgpt", "openai"])
-    guard let stateData = storageStateData(from: cookies) else {
-      log.warning("scrapeChatGPT: no chatgpt/openai cookies in \(browser.profile.browserName)")
+    // The NextAuth session-token cookie is the auth signal. Logging out deletes
+    // it while leaving cf_clearance/csrf behind, so checking it here is more
+    // reliable than scraping the page — a logged-out hit just stalls on
+    // Cloudflare's "Just a moment..." wall and never yields a login page.
+    let signedIn = cookies.contains { $0.name.contains("session-token") }
+    guard signedIn, let stateData = storageStateData(from: cookies) else {
+      log.warning("scrapeChatGPT: no ChatGPT session-token cookie in \(browser.profile.browserName)")
       _lock.withLock {
         _lastIssueMessage =
-          "No ChatGPT session cookies found in \(browser.profile.browserName). Sign in to ChatGPT in that browser."
+          "No ChatGPT session found in \(browser.profile.browserName). Sign in to ChatGPT in that browser."
       }
       return .notSignedIn
     }
