@@ -167,7 +167,9 @@ struct FirefoxFamilyBrowserAdapter: BrowserAdapter {
 
     let parsed = rows.compactMap { columns -> BrowserCookie? in
       guard columns.count >= 8 else { return nil }
-      let expiry = Double(columns[4]) ?? 0
+      // moz_cookies.expiry is milliseconds here; Playwright's storage_state
+      // wants unix seconds, so divide before handing it over.
+      let expiry = (Double(columns[4]) ?? 0) / 1000
       return BrowserCookie(
         domain: columns[0], name: columns[1], value: columns[2],
         path: columns[3].isEmpty ? "/" : columns[3],
