@@ -383,6 +383,8 @@ final class Scraper: @unchecked Sendable {
   }
 
   private static func formatResetInterval(_ interval: TimeInterval) -> String {
+    let minutes = Int(ceil(interval / 60))
+    if minutes < 60 { return "Resets in \(minutes) minute\(minutes == 1 ? "" : "s")." }
     let hours = Int(ceil(interval / 3600))
     if hours >= 24 { return "Resets in \(hours / 24) day\(hours / 24 == 1 ? "" : "s")." }
     return "Resets in \(hours) hour\(hours == 1 ? "" : "s")."
