@@ -328,23 +328,38 @@ final class Scraper: @unchecked Sendable {
   }
 
   private func parseChatGPTText(_ text: String) -> ChatGPTData? {
+    // The analytics page labels each meter and then prints its *remaining*
+    // percent: "5 hour usage limit" → "0%" → "remaining", "Weekly usage limit"
+    // → "69%" → "remaining". Anchor on the labels and read the percent that
+    // follows each, storing used (= 100 - remaining). Anchoring keeps a real
+    // 0%/100% reading instead of discarding it — exactly the out-of-balance
+    // ("0% remaining") case the old value filter silently dropped.
+    let fiveHourPct = remainingToUsed(after: "5 hour usage limit", in: text)
+    let weeklyPct = remainingToUsed(after: "Weekly usage limit", in: text)
+    guard fiveHourPct != nil || weeklyPct != nil else { return nil }
+
     let ns = text as NSString
     let full = NSRange(location: 0, length: ns.length)
-
-    let pctMatches = Self.regexChatGPTPct.matches(in: text, range: full).map {
-      Int(ns.substring(with: $0.range(at: 1))) ?? 0
-    }
-
-    let relevant = pctMatches.filter { $0 < 100 && $0 > 0 }
-    let fiveHourPct = relevant.count >= 1 ? 100 - Double(relevant[0]) : 0
-    let weeklyPct =
-      relevant.count >= 2 ? 100 - Double(relevant[1]) : (relevant.count == 1 ? 0 : 100)
-
     let resets = Self.regexChatGPTResets.matches(in: text, range: full).map {
       normalizeReset(ns.substring(with: $0.range).trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    return ChatGPTData(fiveHourPct: fiveHourPct, weeklyPct: weeklyPct, resets: resets)
+    return ChatGPTData(fiveHourPct: fiveHourPct ?? 0, weeklyPct: weeklyPct ?? 0, resets: resets)
+  }
+
+  // Reads the first percentage printed after `label` and converts the page's
+  // "remaining" figure into "used". Returns nil when the label isn't on the
+  // page, so a structural change fails the parse instead of inventing a number.
+  private func remainingToUsed(after label: String, in text: String) -> Double? {
+    guard let labelRange = text.range(of: label) else { return nil }
+    let tail = String(text[labelRange.upperBound...])
+    let tn = tail as NSString
+    guard
+      let match = Self.regexChatGPTPct.firstMatch(
+        in: tail, range: NSRange(location: 0, length: tn.length))
+    else { return nil }
+    let remaining = Double(tn.substring(with: match.range(at: 1))) ?? 0
+    return 100 - remaining
   }
 
   private func normalizeReset(_ raw: String) -> String {
