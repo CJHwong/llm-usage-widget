@@ -283,6 +283,16 @@ struct DesktopPanel: View {
   // Master switch on but no session yet: prompt to sign in (off stays hidden).
   private var chatGPTNeedsSignIn: Bool { model.usage?.chatgptStatus == .unavailable }
 
+  // Only the meters OpenAI still exposes. A meter parsed as nil (e.g. the 5-hour
+  // limit they dropped) yields no card rather than a fake 0% ring.
+  private var chatGPTCards: [(pct: Double, resets: String, models: [ModelUsage])] {
+    guard let c = model.usage?.chatgpt else { return [] }
+    var cards: [(pct: Double, resets: String, models: [ModelUsage])] = []
+    if let pct = c.fiveHourPct { cards.append((pct, c.fiveHourReset ?? "", [])) }
+    if let pct = c.weeklyPct { cards.append((pct, c.weeklyReset ?? "", [])) }
+    return cards
+  }
+
   var body: some View {
     VStack(spacing: 0) {
       HStack {
@@ -330,10 +340,7 @@ struct DesktopPanel: View {
             DeskDivider()
             DeskProviderSection(
               title: "ChatGPT", url: "https://chatgpt.com/codex/cloud/settings/analytics",
-              cards: [
-                (model.usage?.chatgpt?.fiveHourPct ?? 0, model.usage?.chatgpt?.fiveHourReset ?? "", []),
-                (model.usage?.chatgpt?.weeklyPct ?? 0, model.usage?.chatgpt?.weeklyReset ?? "", []),
-              ])
+              cards: chatGPTCards)
           } else if chatGPTNeedsSignIn {
             DeskDivider()
             DeskSignInSection(

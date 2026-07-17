@@ -56,20 +56,19 @@ struct OllamaData: Codable {
 }
 
 struct ChatGPTData: Codable {
-  let fiveHourPct: Double
-  let weeklyPct: Double
-  // resets[0] is the 5-hour window, resets[1] the weekly one, in page order.
-  let resets: [String]
+  // Optional: OpenAI can pull a meter off the analytics page (they dropped the
+  // 5-hour limit in Jul 2026). nil means "not on the page", which the UI renders
+  // by hiding that card rather than faking a 0% ring.
+  let fiveHourPct: Double?
+  let fiveHourReset: String?
+  let weeklyPct: Double?
+  let weeklyReset: String?
   enum CodingKeys: String, CodingKey {
     case fiveHourPct = "five_hour_pct"
+    case fiveHourReset = "five_hour_reset"
     case weeklyPct = "weekly_pct"
-    case resets
+    case weeklyReset = "weekly_reset"
   }
-
-  // Reach in by position, not .first/.last: a single-element array (partial
-  // parse) must not duplicate one window's reset onto the other card.
-  var fiveHourReset: String { resets.first ?? "" }
-  var weeklyReset: String { resets.count > 1 ? resets[1] : "" }
 }
 
 struct ModelUsage: Codable, Identifiable {

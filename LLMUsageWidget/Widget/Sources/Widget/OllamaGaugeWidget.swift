@@ -77,6 +77,16 @@ private struct PanelView: View {
   private var o: OllamaData? { entry.usage?.ollama }
   private var c: ChatGPTData? { entry.usage?.chatgpt }
 
+  // Only the meters OpenAI still exposes. A meter parsed as nil (e.g. the
+  // 5-hour limit they dropped) yields no card rather than a fake 0% ring.
+  private var chatGPTCards: [(pct: Double, resets: String)] {
+    guard let c else { return [] }
+    var cards: [(pct: Double, resets: String)] = []
+    if let pct = c.fiveHourPct { cards.append((pct, c.fiveHourReset ?? "")) }
+    if let pct = c.weeklyPct { cards.append((pct, c.weeklyReset ?? "")) }
+    return cards
+  }
+
   // No manual edge padding: WidgetKit already insets content by its default
   // 16pt content margin. The dark panel (containerBackground) fills edge to
   // edge; only the inter-element spacing lives here.
@@ -113,10 +123,7 @@ private struct PanelView: View {
         SectionDivider()
         switch entry.usage?.chatgptStatus ?? .off {
         case .on:
-          ProviderColumn(title: "ChatGPT", cards: [
-            (c?.fiveHourPct ?? 0, c?.fiveHourReset ?? ""),
-            (c?.weeklyPct ?? 0, c?.weeklyReset ?? ""),
-          ], ringSize: ringSize, showTitle: true)
+          ProviderColumn(title: "ChatGPT", cards: chatGPTCards, ringSize: ringSize, showTitle: true)
         case .off:
           ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
         case .unavailable:

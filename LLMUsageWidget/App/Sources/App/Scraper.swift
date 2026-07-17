@@ -323,28 +323,39 @@ final class Scraper: @unchecked Sendable {
       log.warning("scrapeChatGPT: parseChatGPTText returned nil")
       return .transientFailure
     }
-    log.info("scrapeChatGPT: parsed successfully - 5h=\(parsed.fiveHourPct)% weekly=\(parsed.weeklyPct)% resets=\(parsed.resets)")
+    log.info("scrapeChatGPT: parsed successfully - 5h=\(String(describing: parsed.fiveHourPct)) weekly=\(String(describing: parsed.weeklyPct)) resets=[\(parsed.fiveHourReset ?? "-"), \(parsed.weeklyReset ?? "-")]")
     return .success(parsed)
   }
 
   private func parseChatGPTText(_ text: String) -> ChatGPTData? {
     // The analytics page labels each meter and then prints its *remaining*
     // percent: "5 hour usage limit" → "0%" → "remaining", "Weekly usage limit"
-    // → "69%" → "remaining". Anchor on the labels and read the percent that
-    // follows each, storing used (= 100 - remaining). Anchoring keeps a real
-    // 0%/100% reading instead of discarding it — exactly the out-of-balance
-    // ("0% remaining") case the old value filter silently dropped.
+    // → "69%" → "remaining". Anchor everything (percent AND reset) on the label
+    // that owns it, so a meter OpenAI removes just parses as nil instead of
+    // shifting the surviving meter's numbers into the wrong slot.
     let fiveHourPct = remainingToUsed(after: "5 hour usage limit", in: text)
     let weeklyPct = remainingToUsed(after: "Weekly usage limit", in: text)
     guard fiveHourPct != nil || weeklyPct != nil else { return nil }
 
-    let ns = text as NSString
-    let full = NSRange(location: 0, length: ns.length)
-    let resets = Self.regexChatGPTResets.matches(in: text, range: full).map {
-      normalizeReset(ns.substring(with: $0.range).trimmingCharacters(in: .whitespacesAndNewlines))
-    }
+    return ChatGPTData(
+      fiveHourPct: fiveHourPct,
+      fiveHourReset: fiveHourPct == nil ? nil : resetAfter(label: "5 hour usage limit", in: text),
+      weeklyPct: weeklyPct,
+      weeklyReset: weeklyPct == nil ? nil : resetAfter(label: "Weekly usage limit", in: text))
+  }
 
-    return ChatGPTData(fiveHourPct: fiveHourPct ?? 0, weeklyPct: weeklyPct ?? 0, resets: resets)
+  // The "Resets ..." line that follows `label`, normalized to a relative
+  // interval. Anchored the same way percents are, so it belongs to the meter
+  // above it rather than to a fixed array position.
+  private func resetAfter(label: String, in text: String) -> String? {
+    guard let labelRange = text.range(of: label) else { return nil }
+    let tail = String(text[labelRange.upperBound...])
+    let tn = tail as NSString
+    guard
+      let match = Self.regexChatGPTResets.firstMatch(
+        in: tail, range: NSRange(location: 0, length: tn.length))
+    else { return nil }
+    return normalizeReset(tn.substring(with: match.range).trimmingCharacters(in: .whitespacesAndNewlines))
   }
 
   // Reads the first percentage printed after `label` and converts the page's
