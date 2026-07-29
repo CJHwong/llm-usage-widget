@@ -253,13 +253,19 @@ private struct DeskProviderSection: View {
   }
 }
 
-// Stands in for a provider section when the selected browser isn't signed in.
-// Same header-as-link affordance as DeskProviderSection so it reads as the same
-// kind of block, just empty with a reason.
-private struct DeskSignInSection: View {
+// Stands in for a provider section when it has no gauges to show: the selected
+// browser isn't signed in, or the scrape stopped landing. Same header-as-link
+// affordance as DeskProviderSection so it reads as the same kind of block, just
+// empty with a reason. Severity above `.low` marks it as a fault, matching the
+// widget's ProviderIndicator.
+private struct DeskStatusSection: View {
   let title: String
   let message: String
+  var detail: [String] = []
+  var severity: DeskSeverity = .low
   let url: String
+
+  private var isFault: Bool { severity != .low }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
@@ -267,9 +273,23 @@ private struct DeskSignInSection: View {
         Text(title).font(.system(size: 10, weight: .medium)).foregroundColor(DeskTheme.secondaryText)
       }.buttonStyle(.plain)
       Button(action: { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }) {
-        Text(message).font(.system(size: 11, weight: .medium)).foregroundColor(DeskTheme.tertiaryText)
-          .frame(maxWidth: .infinity).padding(.vertical, 18)
-          .background(DeskCardBackground(severity: .low, isExpanded: false))
+        VStack(alignment: isFault ? .leading : .center, spacing: 4) {
+          HStack(spacing: 4) {
+            if isFault {
+              Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+            }
+            Text(message).font(.system(size: 11, weight: .medium))
+          }
+          .foregroundColor(isFault ? severity.tint : DeskTheme.tertiaryText)
+          ForEach(detail, id: \.self) { line in
+            Text(line).font(.system(size: 10)).foregroundColor(DeskTheme.secondaryText)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, isFault ? 12 : 18)
+        .padding(.horizontal, isFault ? 12 : 0)
+        .background(DeskCardBackground(severity: severity, isExpanded: false))
       }.buttonStyle(.plain)
     }
     .padding(.horizontal, 18)
@@ -282,6 +302,8 @@ struct DesktopPanel: View {
   private var ollamaSignedIn: Bool { model.usage?.resolvedOllamaStatus == .on }
   // Master switch on but no session yet: prompt to sign in (off stays hidden).
   private var chatGPTNeedsSignIn: Bool { model.usage?.chatgptStatus == .unavailable }
+  // Numbers on disk but the scrape stopped landing: show the fault, not the gauges.
+  private var chatGPTStale: Bool { model.usage?.chatgptStatus == .stale }
 
   // Only the meters OpenAI still exposes. A meter parsed as nil (e.g. the 5-hour
   // limit they dropped) yields no card rather than a fake 0% ring.
@@ -333,7 +355,7 @@ struct DesktopPanel: View {
                 (o.weeklyPct, o.weeklyResetsIn, o.weeklyModels),
               ])
           } else {
-            DeskSignInSection(
+            DeskStatusSection(
               title: "Ollama", message: "Sign in to Ollama", url: "https://ollama.com/settings")
           }
           if chatGPTShown {
@@ -343,8 +365,14 @@ struct DesktopPanel: View {
               cards: chatGPTCards)
           } else if chatGPTNeedsSignIn {
             DeskDivider()
-            DeskSignInSection(
+            DeskStatusSection(
               title: "ChatGPT", message: "Sign in to ChatGPT",
+              url: "https://chatgpt.com/codex/cloud/settings/analytics")
+          } else if chatGPTStale {
+            DeskDivider()
+            DeskStatusSection(
+              title: "ChatGPT", message: "Not updating",
+              detail: model.usage?.chatgptStaleDetail ?? [], severity: .elevated,
               url: "https://chatgpt.com/codex/cloud/settings/analytics")
           }
         }

@@ -3,11 +3,13 @@ import Foundation
 // Derived ChatGPT display state, computed by the host and read by both the
 // widget and the desktop panel. `on` = enabled and signed in (data present);
 // `off` = disabled in the menu bar; `unavailable` = enabled but no data yet
-// (not signed in / scrape failing).
+// (not signed in / scrape failing); `stale` = we still hold numbers but the
+// scrape stopped landing long enough ago that showing them as live would lie.
 enum ChatGPTStatus: String, Codable {
   case on
   case off
   case unavailable
+  case stale
 }
 
 // Derived Ollama display state. `on` = signed in (data present); `unavailable`
@@ -25,17 +27,47 @@ struct UsageData: Codable {
   // Optional for the same reason; a nil value is resolved from `ollama` below.
   var ollamaStatus: OllamaStatus?
   var lastUpdated: String = ""
+  // When the last ChatGPT scrape actually landed, and the short reason the
+  // current one is failing. `lastUpdated` can't answer either: it's rewritten by
+  // every Ollama cycle, so a dead ChatGPT scrape still looks freshly stamped.
+  // Dates use JSONEncoder's default strategy, matching the plain decoders in
+  // Scraper.read and UsageDataStore.readUsage.
+  var chatgptUpdatedAt: Date?
+  var chatgptIssue: String?
   enum CodingKeys: String, CodingKey {
     case ollama, chatgpt
     case chatgptStatus = "chatgpt_status"
     case ollamaStatus = "ollama_status"
     case lastUpdated = "last_updated"
+    case chatgptUpdatedAt = "chatgpt_updated_at"
+    case chatgptIssue = "chatgpt_issue"
   }
 
   // Defaults a nil status (old payloads) from whether data is present.
   var resolvedOllamaStatus: OllamaStatus {
     ollamaStatus ?? (ollama != nil ? .on : .unavailable)
   }
+
+  // Lines the `stale` card prints under its headline: when the numbers stopped
+  // moving, and what is stopping them. Lives here so the widget and the panel
+  // render the same words instead of drifting apart.
+  var chatgptStaleDetail: [String] {
+    var lines: [String] = []
+    if let at = chatgptUpdatedAt {
+      lines.append("Last read \(Self.lastReadFmt.string(from: at))")
+    }
+    if let chatgptIssue { lines.append(chatgptIssue) }
+    return lines
+  }
+
+  // Absolute, not relative: for a meter that stopped, the moment it stopped is
+  // more actionable than "4 days ago".
+  private static let lastReadFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "MMM d HH:mm"
+    return f
+  }()
 }
 
 struct OllamaData: Codable {

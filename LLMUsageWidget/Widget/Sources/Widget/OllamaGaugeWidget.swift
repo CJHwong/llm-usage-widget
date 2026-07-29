@@ -128,6 +128,13 @@ private struct PanelView: View {
           ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
         case .unavailable:
           ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
+        case .stale:
+          // The last numbers are still on disk, but a frozen ring is worse than
+          // no ring: drop the gauges and say when they stopped and why.
+          ProviderIndicator(
+            title: "ChatGPT", message: "Not updating",
+            detail: entry.usage?.chatgptStaleDetail ?? [], severity: .elevated,
+            ringSize: ringSize)
         }
       }
       if entry.usage == nil {
@@ -157,26 +164,43 @@ private struct ProviderColumn: View {
   }
 }
 
-// Stands in for a provider slot when it's off or not signed in. A fixed-size
-// widget can't reflow away the section, so it says why it's empty. Heights
-// roughly match a gauge row so toggling doesn't jump the layout.
+// Stands in for a provider slot when it can't show gauges: off, not signed in,
+// or no longer updating. A fixed-size widget can't reflow away the section, so
+// it says why it's empty. Heights roughly match a gauge row so toggling doesn't
+// jump the layout. Anything above `.low` severity reads as a fault and gets the
+// warning glyph and tint; plain states stay quiet and centered.
 private struct ProviderIndicator: View {
   let title: String
   let message: String
+  var detail: [String] = []
+  var severity: CardSeverity = .low
   let ringSize: CGFloat
   var showTitle: Bool = true
+
+  private var isFault: Bool { severity != .low }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       if showTitle {
         Text(title).font(.system(size: 12, weight: .semibold)).foregroundColor(GlassTheme.secondaryText)
       }
-      Text(message)
-        .font(.system(size: 13, weight: .medium))
-        .foregroundColor(GlassTheme.tertiaryText)
-        .frame(maxWidth: .infinity)
-        .frame(height: ringSize + 36)
-        .background(GlassCardBackground(severity: .low))
+      VStack(alignment: isFault ? .leading : .center, spacing: 5) {
+        HStack(spacing: 5) {
+          if isFault {
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11))
+          }
+          Text(message).font(.system(size: 13, weight: .medium))
+        }
+        .foregroundColor(isFault ? severity.tint : GlassTheme.tertiaryText)
+        ForEach(detail, id: \.self) { line in
+          Text(line).font(.system(size: 11)).foregroundColor(GlassTheme.secondaryText)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .padding(isFault ? 12 : 0)
+      .frame(maxWidth: .infinity)
+      .frame(minHeight: ringSize + 36)
+      .background(GlassCardBackground(severity: severity))
     }
   }
 }
