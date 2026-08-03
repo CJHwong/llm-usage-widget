@@ -3,6 +3,16 @@ import OSLog
 
 private let log = Logger(subsystem: "com.llmwidget", category: "scraper")
 
+// What a scrape cycle hands back to load(): the fresh data plus whether this
+// cycle started a background ChatGPT scrape. That background pass is what posts
+// kChatGPTDone, which clears the panel's isRefreshing; when it wasn't started
+// (ChatGPT off, nothing to scrape, or one already running), load() must clear
+// the flag itself or the panel spins forever.
+struct ScrapeOutcome {
+  let usage: UsageData?
+  let spawnedChatGPTScrape: Bool
+}
+
 final class Scraper: @unchecked Sendable {
   private let paths: AppPaths
   private let dataFile: URL
@@ -98,14 +108,14 @@ final class Scraper: @unchecked Sendable {
     _lock.withLock { _lastIssueMessage }
   }
 
-  func scrape() async -> UsageData? {
+  func scrape() async -> ScrapeOutcome {
     log.info("scrape() started")
     let wantChatGPT = chatGPTEnabled
     let preflight = preflightMessage()
     _lock.withLock { _lastIssueMessage = preflight }
     guard let browser = BrowserRegistry.firstSupportedProfile() else {
       log.warning("No supported browser profile found")
-      return nil
+      return ScrapeOutcome(usage: nil, spawnedChatGPTScrape: false)
     }
     log.info("Found browser profile: \(browser.profile.browserName) at \(browser.profile.profilePath)")
     let fmt = Self.timeFmt
@@ -146,6 +156,7 @@ final class Scraper: @unchecked Sendable {
       failing: merged.chatgptIssue != nil)
     write(merged)
 
+    var spawnedChatGPTScrape = false
     if wantChatGPT {
       let shouldScrape = _lock.withLock { () -> Bool in
         if _isScrapingChatGPT { return false }
@@ -153,6 +164,7 @@ final class Scraper: @unchecked Sendable {
         return true
       }
       if shouldScrape {
+        spawnedChatGPTScrape = true
         log.info("ChatGPT enabled, starting ChatGPT scrape on background thread")
         DispatchQueue.global().async { [self, browser] in
           defer { self._lock.withLock { self._isScrapingChatGPT = false } }
@@ -196,7 +208,7 @@ final class Scraper: @unchecked Sendable {
       log.notice("ChatGPT disabled; skipping ChatGPT scrape")
     }
     log.info("scrape() returning")
-    return read()
+    return ScrapeOutcome(usage: read(), spawnedChatGPTScrape: spawnedChatGPTScrape)
   }
 
   private func scrapeOllama(cookies: String) async -> OllamaData? {

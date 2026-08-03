@@ -192,8 +192,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // control returns here on main to update panelModel and the widget.
     Task { [self] in
       if scraper.read() != nil { WidgetCenter.shared.reloadAllTimelines() }
-      let fresh = await scraper.scrape()
-      if let fresh {
+      let outcome = await scraper.scrape()
+      if let fresh = outcome.usage {
         panelModel.usage = fresh
         WidgetCenter.shared.reloadAllTimelines()
       } else if scraper.read() == nil {
@@ -203,9 +203,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log.notice("load(): scrape returned nil but cached data exists, keeping stale")
       }
       panelModel.isLoading = false
-      // The ChatGPT background scrape clears isRefreshing via kChatGPTDone;
-      // if ChatGPT is off there's no background pass, so clear it now.
-      if !UserDefaults.standard.bool(forKey: chatGPTEnabledKey) { panelModel.isRefreshing = false }
+      // The ChatGPT background scrape clears isRefreshing via kChatGPTDone; if
+      // this cycle didn't hand off to one (ChatGPT off, nothing to scrape, or a
+      // scrape already running), clear the flag ourselves or the panel spins
+      // forever on a stuck "Refreshing...".
+      if !outcome.spawnedChatGPTScrape { panelModel.isRefreshing = false }
     }
   }
 
