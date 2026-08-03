@@ -219,7 +219,6 @@ private struct DeskProviderSection: View {
   @State private var expandedIndex: Int? = nil
 
   private let gap: CGFloat = 8
-  private var cardW: CGFloat { 300 - 36 }
   private let cardAnimation = Animation.spring(response: 0.32, dampingFraction: 0.84)
 
   var body: some View {
@@ -229,7 +228,7 @@ private struct DeskProviderSection: View {
       }.buttonStyle(.plain)
       if let idx = expandedIndex, idx < cards.count {
         DeskCard(pct: cards[idx].pct, resets: cards[idx].resets, models: cards[idx].models, isExpanded: true)
-          .frame(width: cardW)
+          .frame(maxWidth: .infinity)
           .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.97, anchor: .top)),
                                   removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))))
           .onTapGesture { withAnimation(cardAnimation) { expandedIndex = nil } }
@@ -237,7 +236,7 @@ private struct DeskProviderSection: View {
         HStack(spacing: gap) {
           ForEach(cards.indices, id: \.self) { i in
             DeskCard(pct: cards[i].pct, resets: cards[i].resets, models: cards[i].models, isExpanded: false)
-              .frame(width: (cardW - gap) / 2)
+              .frame(maxWidth: .infinity)
               .onTapGesture {
                 guard !cards[i].models.isEmpty else { return }
                 withAnimation(cardAnimation) { expandedIndex = i }
