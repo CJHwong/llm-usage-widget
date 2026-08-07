@@ -127,7 +127,16 @@ private struct PanelView: View {
         case .off:
           ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
         case .unavailable:
-          ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
+          // No data at all. A scrape issue (launch failure, parse failure)
+          // explains why; only a clean not-signed-in (issue nil) is a sign-in
+          // prompt.
+          if let issue = entry.usage?.chatgptIssue {
+            ProviderIndicator(
+              title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
+              ringSize: ringSize)
+          } else {
+            ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
+          }
         case .stale:
           // The last numbers are still on disk, but a frozen ring is worse than
           // no ring: drop the gauges and say when they stopped and why.

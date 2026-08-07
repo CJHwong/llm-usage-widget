@@ -278,14 +278,21 @@ final class Scraper: @unchecked Sendable {
   }
 
   // Why a Playwright launch most likely failed, in UI-sized words. Checks the
-  // two prerequisites we can verify locally before falling back to a generic
-  // error, because "Playwright would not launch" is useless on its own.
-  private func playwrightLaunchIssue(for browserName: String) -> String {
+  // two prerequisites we can verify locally before falling back to the daemon's
+  // own stderr, because "Playwright would not launch" is useless on its own and
+  // the real error names the missing browser build and its fix.
+  private func playwrightLaunchIssue(for browserName: String, stderr: String) -> String {
     if !FileManager.default.isExecutableFile(atPath: playwrightCLI) {
       return "playwright-cli not installed"
     }
     if browserName == "firefox", !isPlaywrightFirefoxInstalled() {
       return "Playwright Firefox not installed"
+    }
+    // The daemon prints the cause last, e.g. `Error: Browser "firefox" is not
+    // installed; expected executable at ... Run \`playwright-cli install-browser
+    // firefox\` to install`.
+    if let line = stderr.components(separatedBy: "\n").last(where: { $0.hasPrefix("Error: ") }) {
+      return String(line.dropFirst("Error: ".count))
     }
     return "Playwright would not launch"
   }
@@ -330,26 +337,26 @@ final class Scraper: @unchecked Sendable {
     }
 
     // open a blank context, load the cookies, then navigate authenticated.
-    guard
-      runPlaywrightCommand(
-        ["-s=\(sessionName)", "open", "--browser", browser.adapter.playwrightBrowserName, "about:blank"],
-        timeout: 30) != nil
-    else {
-      let issue = playwrightLaunchIssue(for: browser.adapter.playwrightBrowserName)
+    let openResult = runPlaywrightCommand(
+      ["-s=\(sessionName)", "open", "--browser", browser.adapter.playwrightBrowserName, "about:blank"],
+      timeout: 30)
+    guard openResult.output != nil else {
+      let issue = playwrightLaunchIssue(
+        for: browser.adapter.playwrightBrowserName, stderr: openResult.stderr)
       log.error("scrapeChatGPT: open failed (\(issue))")
       _lock.withLock {
         _lastIssueMessage = preflightMessage() ?? "Could not launch Playwright for ChatGPT."
       }
       return .transientFailure(issue)
     }
-    guard runPlaywrightCommand(["-s=\(sessionName)", "state-load", stateFile.path]) != nil else {
+    guard runPlaywrightCommand(["-s=\(sessionName)", "state-load", stateFile.path]).output != nil else {
       log.error("scrapeChatGPT: state-load failed")
       return .transientFailure("Could not load the ChatGPT session")
     }
     guard
       runPlaywrightCommand(
         ["-s=\(sessionName)", "goto", "https://chatgpt.com/codex/cloud/settings/analytics"],
-        timeout: 30) != nil
+        timeout: 30).output != nil
     else {
       log.error("scrapeChatGPT: goto failed")
       return .transientFailure("Could not open the analytics page")
@@ -565,9 +572,10 @@ final class Scraper: @unchecked Sendable {
     while Date() < deadline {
       attempt += 1
       log.info("waitForChatGPTPage: poll attempt \(attempt)")
-      guard let output = runPlaywrightCommand([
+      let result = runPlaywrightCommand([
         "-s=\(sessionName)", "eval", "document.body?.innerText ?? ''",
-      ]) else {
+      ])
+      guard let output = result.output else {
         log.error("waitForChatGPTPage: runPlaywrightCommand returned nil at attempt \(attempt)")
         _lock.withLock { _lastIssueMessage = "Could not read the ChatGPT page from Playwright." }
         return .unavailable
@@ -598,7 +606,15 @@ final class Scraper: @unchecked Sendable {
     body.contains("Resets") && body.contains("%")
   }
 
-  private func runPlaywrightCommand(_ arguments: [String], timeout: TimeInterval = 10) -> String? {
+  // What a Playwright invocation returned: stdout (nil when the command failed)
+  // plus stderr, which names the real cause when a launch fails (missing browser
+  // build, daemon crash) and is worth surfacing instead of a generic guess.
+  private struct PlaywrightResult {
+    let output: String?
+    let stderr: String
+  }
+
+  private func runPlaywrightCommand(_ arguments: [String], timeout: TimeInterval = 10) -> PlaywrightResult {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: playwrightCLI)
     proc.arguments = arguments
@@ -611,24 +627,26 @@ final class Scraper: @unchecked Sendable {
     proc.terminationHandler = { _ in sem.signal() }
     guard (try? proc.run()) != nil else {
       log.error("runPlaywrightCommand: failed to launch playwright process")
-      return nil
+      return PlaywrightResult(output: nil, stderr: "")
     }
     if sem.wait(timeout: .now() + timeout) == .timedOut {
       proc.terminate()
       log.error("runPlaywrightCommand: timed out after 10s, args=\(arguments.joined(separator: " "))")
-      return nil
+      return PlaywrightResult(output: nil, stderr: "")
     }
     let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     if proc.terminationStatus != 0 {
       log.error("runPlaywrightCommand: exit code \(proc.terminationStatus), args=\(arguments.joined(separator: " "))")
       log.error("runPlaywrightCommand: stderr=\(stderr)")
-      return nil
+      return PlaywrightResult(output: nil, stderr: stderr)
     }
     if !stderr.isEmpty {
       log.info("runPlaywrightCommand: stderr=\(stderr)")
     }
 
-    return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    return PlaywrightResult(
+      output: String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+      stderr: stderr)
   }
 
   private func closePlaywrightSession(_ sessionName: String) {
@@ -643,7 +661,7 @@ final class Scraper: @unchecked Sendable {
   // session — to close anything we left behind.
   func reapStaleSessions() {
     guard FileManager.default.isExecutableFile(atPath: playwrightCLI) else { return }
-    guard let output = runPlaywrightCommand(["list"]) else {
+    guard let output = runPlaywrightCommand(["list"]).output else {
       log.warning("reapStaleSessions: could not list Playwright sessions")
       return
     }

@@ -299,8 +299,9 @@ struct DesktopPanel: View {
   @ObservedObject var model: PanelModel
   private var chatGPTShown: Bool { model.usage?.chatgptStatus == .on }
   private var ollamaSignedIn: Bool { model.usage?.resolvedOllamaStatus == .on }
-  // Master switch on but no session yet: prompt to sign in (off stays hidden).
-  private var chatGPTNeedsSignIn: Bool { model.usage?.chatgptStatus == .unavailable }
+  // Master switch on but no data at all: a scrape issue explains why, or it's
+  // a sign-in prompt (off stays hidden).
+  private var chatGPTUnavailable: Bool { model.usage?.chatgptStatus == .unavailable }
   // Numbers on disk but the scrape stopped landing: show the fault, not the gauges.
   private var chatGPTStale: Bool { model.usage?.chatgptStatus == .stale }
 
@@ -362,11 +363,17 @@ struct DesktopPanel: View {
             DeskProviderSection(
               title: "ChatGPT", url: "https://chatgpt.com/codex/cloud/settings/analytics",
               cards: chatGPTCards)
-          } else if chatGPTNeedsSignIn {
+          } else if chatGPTUnavailable {
             DeskDivider()
-            DeskStatusSection(
-              title: "ChatGPT", message: "Sign in to ChatGPT",
-              url: "https://chatgpt.com/codex/cloud/settings/analytics")
+            if let issue = model.usage?.chatgptIssue {
+              DeskStatusSection(
+                title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
+                url: "https://chatgpt.com/codex/cloud/settings/analytics")
+            } else {
+              DeskStatusSection(
+                title: "ChatGPT", message: "Sign in to ChatGPT",
+                url: "https://chatgpt.com/codex/cloud/settings/analytics")
+            }
           } else if chatGPTStale {
             DeskDivider()
             DeskStatusSection(
