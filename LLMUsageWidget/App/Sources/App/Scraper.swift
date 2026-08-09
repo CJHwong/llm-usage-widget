@@ -603,7 +603,15 @@ final class Scraper: @unchecked Sendable {
   }
 
   private func isChatGPTAnalyticsPageReady(_ body: String) -> Bool {
-    body.contains("Resets") && body.contains("%")
+    // The meters themselves ("Weekly usage limit" → "100%" → "remaining") are
+    // the readiness signal. The "Resets ..." line OpenAI used to print under
+    // each meter has come and gone before; gating on it times out the whole
+    // scrape when it's absent even though the numbers are right there. The
+    // reset stays optional downstream: parseChatGPTText yields nil for it and
+    // both UIs drop just the label, keeping the ring. Self-heals when the
+    // reset line comes back.
+    let hasMeterLabel = body.contains("Weekly usage limit") || body.contains("5 hour usage limit")
+    return hasMeterLabel && body.contains("%")
   }
 
   // What a Playwright invocation returned: stdout (nil when the command failed)
