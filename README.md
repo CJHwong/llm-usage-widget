@@ -104,6 +104,6 @@ The scraper logs any of these instead of producing data:
 
 **Ollama:** reads session cookies from the browser profile and fetches `ollama.com/settings` with `curl`, then parses the usage meters out of the HTML.
 
-**ChatGPT:** launches a Playwright Firefox session that reuses the browser's cookies, opens the Codex analytics page, and polls until it renders before parsing.
+**ChatGPT:** launches a Playwright Firefox session that reuses the browser's cookies, loads a ChatGPT settings page, and reads the `backend-api/wham/usage` response that page fetches. It reads the API's JSON, not rendered page text: OpenAI removed the Codex analytics page in Oct 2026, and the API survives UI redesigns.
 
 Both run locally in the host app. The widget extension only reads the mirrored cache; it never scrapes. The only network traffic is the requests to ollama.com and chatgpt.com that your browser would make anyway.

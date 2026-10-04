@@ -42,24 +42,10 @@ final class Scraper: @unchecked Sendable {
   private static let regexOllamaWidth = try! NSRegularExpression(pattern: #"width:\s*([\d.]+)%"#)
   private static let regexOllamaPct = try! NSRegularExpression(pattern: #"([\d.]+)%"#)
   private static let regexOllamaResets = try! NSRegularExpression(pattern: "Resets[^<]*")
-  private static let regexChatGPTResets = try! NSRegularExpression(pattern: "Resets[^\\n]*")
-  private static let regexChatGPTPct = try! NSRegularExpression(pattern: #"(\d+)%"#)
 
   private static let timeFmt: DateFormatter = {
     let f = DateFormatter()
     f.dateFormat = "HH:mm"
-    return f
-  }()
-  private static let resetTimeFmt: DateFormatter = {
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "en_US_POSIX")
-    f.dateFormat = "h:mm a"
-    return f
-  }()
-  private static let resetDateFmt: DateFormatter = {
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "en_US_POSIX")
-    f.dateFormat = "MMM d, yyyy h:mm a"
     return f
   }()
 
@@ -277,6 +263,56 @@ final class Scraper: @unchecked Sendable {
     case transientFailure(String)
   }
 
+  // OpenAI rewrote the ChatGPT settings UI in Oct 2026 and the analytics page the
+  // old scrape read is gone (the URL now redirects, and a cold automated visit
+  // meets a Cloudflare challenge). The page still fetches its own numbers from
+  // /backend-api/wham/usage, so we load a page and read that response instead of
+  // matching rendered text. Nothing here depends on page copy, so the next
+  // redesign does not break it.
+  private static let usageCaptureScript = """
+    async (page) => {
+      let captured = null;
+      page.on('response', async (res) => {
+        if (!res.url().includes('/backend-api/wham/usage')) return;
+        try { captured = await res.json(); } catch (e) { /* not JSON */ }
+      });
+      try {
+        await page.goto('https://chatgpt.com/settings/general-settings', {
+          waitUntil: 'domcontentloaded', timeout: 25000,
+        });
+      } catch (e) { /* a slow load can still have fired the request */ }
+      for (let i = 0; i < 20 && captured === null; i++) await page.waitForTimeout(500);
+      return JSON.stringify(captured);
+    }
+    """
+
+  // The slice of /backend-api/wham/usage we read. Every field is optional and
+  // unknown keys are ignored, so an added or removed field cannot fail the decode.
+  private struct UsageResponse: Decodable {
+    let rateLimit: RateLimit?
+    enum CodingKeys: String, CodingKey { case rateLimit = "rate_limit" }
+  }
+
+  private struct RateLimit: Decodable {
+    let primaryWindow: UsageWindow?
+    let secondaryWindow: UsageWindow?
+    enum CodingKeys: String, CodingKey {
+      case primaryWindow = "primary_window"
+      case secondaryWindow = "secondary_window"
+    }
+  }
+
+  private struct UsageWindow: Decodable {
+    let usedPercent: Double?
+    let limitWindowSeconds: Double?
+    let resetAt: Double?
+    enum CodingKeys: String, CodingKey {
+      case usedPercent = "used_percent"
+      case limitWindowSeconds = "limit_window_seconds"
+      case resetAt = "reset_at"
+    }
+  }
+
   // Why a Playwright launch most likely failed, in UI-sized words. Checks the
   // two prerequisites we can verify locally before falling back to the daemon's
   // own stderr, because "Playwright would not launch" is useless on its own and
@@ -353,107 +389,82 @@ final class Scraper: @unchecked Sendable {
       log.error("scrapeChatGPT: state-load failed")
       return .transientFailure("Could not load the ChatGPT session")
     }
-    guard
-      runPlaywrightCommand(
-        ["-s=\(sessionName)", "goto", "https://chatgpt.com/codex/cloud/settings/analytics"],
-        timeout: 30).output != nil
+    let scriptFile = tmpDir.appendingPathComponent("capture-usage.js")
+    guard (try? Self.usageCaptureScript.write(to: scriptFile, atomically: true, encoding: .utf8)) != nil
     else {
-      log.error("scrapeChatGPT: goto failed")
-      return .transientFailure("Could not open the analytics page")
+      log.error("scrapeChatGPT: failed to write the capture script")
+      return .transientFailure("Could not stage the usage capture")
     }
 
-    log.info("scrapeChatGPT: entering waitForChatGPTPage loop")
-    let body: String
-    switch waitForChatGPTPage(sessionName: sessionName) {
-    case .ready(let pageBody):
-      body = pageBody
-    case .notSignedIn:
-      log.warning("scrapeChatGPT: not signed in")
-      return .notSignedIn
-    case .unavailable:
-      log.warning("scrapeChatGPT: analytics page never became ready")
-      if _lock.withLock({ _lastIssueMessage }) == nil {
-        _lock.withLock {
-          _lastIssueMessage =
-            "ChatGPT opened but the analytics page never became ready. Check that you are signed in and still have access to Codex analytics."
-        }
+    // --raw drops playwright-cli's "### Result" wrapper, so stdout is exactly the
+    // script's return value: a JSON string holding the captured payload.
+    let capture = runPlaywrightCommand(
+      ["-s=\(sessionName)", "--raw", "run-code", "--filename", scriptFile.path],
+      timeout: 40)
+    guard let output = capture.output else {
+      log.error("scrapeChatGPT: run-code failed, stderr=\(capture.stderr)")
+      return .transientFailure("Could not read the usage API")
+    }
+
+    // Signed out, or a page that never fired the call, yields the literal "null".
+    // Both land here, and both are worth the same message.
+    guard let json = try? JSONDecoder().decode(String.self, from: Data(output.utf8)),
+      let response = try? JSONDecoder().decode(UsageResponse.self, from: Data(json.utf8)),
+      let parsed = chatGPTData(from: response)
+    else {
+      log.warning("scrapeChatGPT: capture held no usable usage window")
+      _lock.withLock {
+        _lastIssueMessage =
+          "ChatGPT opened but reported no usage window. Check that you are signed in and still have Codex access."
       }
-      return .transientFailure("Analytics page never loaded")
-    }
-    log.info("scrapeChatGPT: page body received, length=\(body.count)")
-    log.debug("scrapeChatGPT: body preview=\(body.prefix(500))")
-
-    guard let parsed = parseChatGPTText(body) else {
-      log.warning("scrapeChatGPT: parseChatGPTText returned nil")
-      return .transientFailure("Could not read the usage meters")
+      return .transientFailure("No usage window reported")
     }
     log.info("scrapeChatGPT: parsed successfully - 5h=\(String(describing: parsed.fiveHourPct)) weekly=\(String(describing: parsed.weeklyPct)) resets=[\(parsed.fiveHourReset ?? "-"), \(parsed.weeklyReset ?? "-")]")
     return .success(parsed)
   }
 
-  private func parseChatGPTText(_ text: String) -> ChatGPTData? {
-    // The analytics page labels each meter and then prints its *remaining*
-    // percent: "5 hour usage limit" → "0%" → "remaining", "Weekly usage limit"
-    // → "69%" → "remaining". Anchor everything (percent AND reset) on the label
-    // that owns it, so a meter OpenAI removes just parses as nil instead of
-    // shifting the surviving meter's numbers into the wrong slot.
-    let fiveHourPct = remainingToUsed(after: "5 hour usage limit", in: text)
-    let weeklyPct = remainingToUsed(after: "Weekly usage limit", in: text)
-    guard fiveHourPct != nil || weeklyPct != nil else { return nil }
+  // The 5-hour window, in seconds. The API does not label its windows, so the
+  // only way to tell them apart is their length.
+  private static let fiveHourWindowSeconds: Double = 5 * 3600
+  private static let dayInSeconds: Double = 24 * 3600
+
+  // Maps the response's two windows onto the widget's two meters. Which slot a
+  // window arrives in is not fixed: a team plan reports the weekly window as
+  // `primary_window` with `secondary_window` null, the reverse of the older
+  // Plus layout. Classify by duration, never by position.
+  private func chatGPTData(from response: UsageResponse) -> ChatGPTData? {
+    let windows = [response.rateLimit?.primaryWindow, response.rateLimit?.secondaryWindow]
+      .compactMap { $0 }
+
+    var fiveHour: UsageWindow?
+    var weekly: UsageWindow?
+    for window in windows {
+      guard let seconds = window.limitWindowSeconds else { continue }
+      // Within an hour of 5h counts as the 5-hour meter; anything a day or
+      // longer is the weekly one. A window of an unknown length is ignored
+      // rather than guessed into a slot.
+      if abs(seconds - Self.fiveHourWindowSeconds) <= 3600 {
+        fiveHour = window
+      } else if seconds >= Self.dayInSeconds {
+        weekly = window
+      }
+    }
+    guard fiveHour != nil || weekly != nil else { return nil }
 
     return ChatGPTData(
-      fiveHourPct: fiveHourPct,
-      fiveHourReset: fiveHourPct == nil ? nil : resetAfter(label: "5 hour usage limit", in: text),
-      weeklyPct: weeklyPct,
-      weeklyReset: weeklyPct == nil ? nil : resetAfter(label: "Weekly usage limit", in: text))
+      fiveHourPct: fiveHour?.usedPercent,
+      fiveHourReset: fiveHour.flatMap { resetText(for: $0) },
+      weeklyPct: weekly?.usedPercent,
+      weeklyReset: weekly.flatMap { resetText(for: $0) })
   }
 
-  // The "Resets ..." line that follows `label`, normalized to a relative
-  // interval. Anchored the same way percents are, so it belongs to the meter
-  // above it rather than to a fixed array position.
-  private func resetAfter(label: String, in text: String) -> String? {
-    guard let labelRange = text.range(of: label) else { return nil }
-    let tail = String(text[labelRange.upperBound...])
-    let tn = tail as NSString
-    guard
-      let match = Self.regexChatGPTResets.firstMatch(
-        in: tail, range: NSRange(location: 0, length: tn.length))
-    else { return nil }
-    return normalizeReset(tn.substring(with: match.range).trimmingCharacters(in: .whitespacesAndNewlines))
-  }
-
-  // Reads the first percentage printed after `label` and converts the page's
-  // "remaining" figure into "used". Returns nil when the label isn't on the
-  // page, so a structural change fails the parse instead of inventing a number.
-  private func remainingToUsed(after label: String, in text: String) -> Double? {
-    guard let labelRange = text.range(of: label) else { return nil }
-    let tail = String(text[labelRange.upperBound...])
-    let tn = tail as NSString
-    guard
-      let match = Self.regexChatGPTPct.firstMatch(
-        in: tail, range: NSRange(location: 0, length: tn.length))
-    else { return nil }
-    let remaining = Double(tn.substring(with: match.range(at: 1))) ?? 0
-    return 100 - remaining
-  }
-
-  private func normalizeReset(_ raw: String) -> String {
-    let stripped = raw.replacingOccurrences(of: "Resets ", with: "").trimmingCharacters(in: .whitespaces)
-    // Already relative (e.g. "Resets in 3 hours")
-    if stripped.hasPrefix("in ") { return raw }
-    // Time-only format (e.g. "3:00 AM")
-    if let time = Self.resetTimeFmt.date(from: stripped) {
-      let now = Date()
-      let cal = Calendar.current
-      var target = cal.date(bySettingHour: cal.component(.hour, from: time), minute: cal.component(.minute, from: time), second: 0, of: now)
-        ?? now.addingTimeInterval(86400)
-      if target <= now { target = target.addingTimeInterval(86400) }
-      return Self.formatResetInterval(target.timeIntervalSinceNow)
-    }
-    // Full date format (e.g. "Aug 1, 2025 3:00 AM")
-    guard let date = Self.resetDateFmt.date(from: stripped) else { return raw }
-    let interval = date.timeIntervalSinceNow
-    guard interval > 0 else { return raw }
+  // The API reports an absolute unix reset; the UI prints a relative interval.
+  // `formatResetInterval` already rounds up, so a window that has just reset
+  // reads as minutes rather than "0 hours".
+  private func resetText(for window: UsageWindow) -> String? {
+    guard let resetAt = window.resetAt else { return nil }
+    let interval = Date(timeIntervalSince1970: resetAt).timeIntervalSinceNow
+    guard interval > 0 else { return nil }
     return Self.formatResetInterval(interval)
   }
 
@@ -552,68 +563,6 @@ final class Scraper: @unchecked Sendable {
     return issues
   }
 
-  // What the analytics-page poll landed on: ready with body, a definitive
-  // logged-out page, or no usable page within the deadline.
-  private enum ChatGPTPageState {
-    case ready(String)
-    case notSignedIn
-    case unavailable
-  }
-
-  private func waitForChatGPTPage(sessionName: String) -> ChatGPTPageState {
-    let deadline = Date().addingTimeInterval(30)
-    log.info("waitForChatGPTPage: polling for up to 30s, session=\(sessionName)")
-    var attempt = 0
-
-    // Give playwright time to open the browser and load the page
-    log.info("waitForChatGPTPage: initial 3s delay for Playwright browser to start")
-    Thread.sleep(forTimeInterval: 3)
-
-    while Date() < deadline {
-      attempt += 1
-      log.info("waitForChatGPTPage: poll attempt \(attempt)")
-      let result = runPlaywrightCommand([
-        "-s=\(sessionName)", "eval", "document.body?.innerText ?? ''",
-      ])
-      guard let output = result.output else {
-        log.error("waitForChatGPTPage: runPlaywrightCommand returned nil at attempt \(attempt)")
-        _lock.withLock { _lastIssueMessage = "Could not read the ChatGPT page from Playwright." }
-        return .unavailable
-      }
-
-      let body = decodePlaywrightStringResult(output)
-      log.debug("waitForChatGPTPage: attempt \(attempt) raw output length=\(output.count), decoded length=\(body.count)")
-      log.debug("waitForChatGPTPage: attempt \(attempt) body=\(body.prefix(300))")
-
-      if isChatGPTAnalyticsPageReady(body) {
-        log.info("waitForChatGPTPage: analytics page ready at attempt \(attempt)")
-        return .ready(body)
-      }
-      if body.lowercased().contains("log in") || body.lowercased().contains("sign up") {
-        log.warning("waitForChatGPTPage: login page detected at attempt \(attempt)")
-        _lock.withLock { _lastIssueMessage = "ChatGPT needs an active signed-in session in the selected browser." }
-        return .notSignedIn
-      }
-      log.info("waitForChatGPTPage: not ready yet, sleeping 1s")
-      Thread.sleep(forTimeInterval: 1)
-    }
-
-    log.warning("waitForChatGPTPage: timed out after \(attempt) attempts")
-    return .unavailable
-  }
-
-  private func isChatGPTAnalyticsPageReady(_ body: String) -> Bool {
-    // The meters themselves ("Weekly usage limit" → "100%" → "remaining") are
-    // the readiness signal. The "Resets ..." line OpenAI used to print under
-    // each meter has come and gone before; gating on it times out the whole
-    // scrape when it's absent even though the numbers are right there. The
-    // reset stays optional downstream: parseChatGPTText yields nil for it and
-    // both UIs drop just the label, keeping the ring. Self-heals when the
-    // reset line comes back.
-    let hasMeterLabel = body.contains("Weekly usage limit") || body.contains("5 hour usage limit")
-    return hasMeterLabel && body.contains("%")
-  }
-
   // What a Playwright invocation returned: stdout (nil when the command failed)
   // plus stderr, which names the real cause when a launch fails (missing browser
   // build, daemon crash) and is worth surfacing instead of a generic guess.
@@ -687,25 +636,6 @@ final class Scraper: @unchecked Sendable {
       log.info("reapStaleSessions: closing \(name)")
       closePlaywrightSession(name)
     }
-  }
-
-  private func decodePlaywrightStringResult(_ output: String) -> String {
-    guard let resultSection = output.components(separatedBy: "### Result\n").dropFirst().first
-    else { return "" }
-    guard let firstLine = resultSection.components(separatedBy: "\n").first else { return "" }
-    let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard trimmed.hasPrefix("\""), trimmed.hasSuffix("\""), trimmed.count >= 2 else {
-      return trimmed
-    }
-
-    let raw = String(trimmed.dropFirst().dropLast())
-    // Process \\ first (via placeholder) so it doesn't feed into \n, \t, \"
-    return raw
-      .replacingOccurrences(of: "\\\\", with: "\u{0001}")
-      .replacingOccurrences(of: "\\n", with: "\n")
-      .replacingOccurrences(of: "\\t", with: "\t")
-      .replacingOccurrences(of: "\\\"", with: "\"")
-      .replacingOccurrences(of: "\u{0001}", with: "\\")
   }
 
   private func isPlaywrightFirefoxInstalled() -> Bool {
