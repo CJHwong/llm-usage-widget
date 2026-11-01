@@ -5,10 +5,11 @@ import OSLog
 
 private let log = Logger(subsystem: "com.llmwidget", category: "app")
 
-// UserDefaults keys for the two menu-bar toggles. The host owns both; the
-// sandboxed widget never reads them (it reads the derived chatgptStatus the
-// scraper writes into usage.json).
+// UserDefaults keys for the menu-bar toggles. The host owns them; the sandboxed
+// widget never reads them (it reads the derived provider statuses the scraper
+// writes into usage.json).
 let chatGPTEnabledKey = "chatGPTEnabled"
+let claudeEnabledKey = "claudeEnabled"
 let showDesktopPanelKey = "showDesktopPanel"
 // Which browser to read cookies from. "Automatic" means the first detected
 // browser in registry order; a specific name pins the source to that browser.
@@ -28,6 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var panelWindow: NSWindow?
   private var lockFileDescriptor: Int32 = -1
   private var timer: Timer?
+  // A cycle can outlive its 300s tick (a slow browser pass, a slow curl). Skip
+  // the tick instead of stacking another Task; the old code stacked them until
+  // every cooperative thread was blocked.
+  private var loadInFlight = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -37,7 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     UserDefaults.standard.register(defaults: [
-      showDesktopPanelKey: true, chatGPTEnabledKey: false,
+      showDesktopPanelKey: true, chatGPTEnabledKey: false, claudeEnabledKey: true,
       preferredBrowserKey: automaticBrowserValue,
     ])
     log.info("App did finish launching")
@@ -47,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     buildMenu()
     NotificationCenter.default.addObserver(
-      self, selector: #selector(chatGPTDone), name: kChatGPTDone, object: nil)
+      self, selector: #selector(browserScrapeDone), name: kBrowserScrapeDone, object: nil)
 
     if UserDefaults.standard.bool(forKey: showDesktopPanelKey) { showPanel() }
     load()
@@ -77,6 +82,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     chatGPTItem.target = self
     chatGPTItem.state = UserDefaults.standard.bool(forKey: chatGPTEnabledKey) ? .on : .off
     menu.addItem(chatGPTItem)
+
+    let claudeItem = NSMenuItem(
+      title: "Enable Claude", action: #selector(toggleClaude(_:)), keyEquivalent: "")
+    claudeItem.target = self
+    claudeItem.state = UserDefaults.standard.bool(forKey: claudeEnabledKey) ? .on : .off
+    menu.addItem(claudeItem)
 
     let browserItem = NSMenuItem(title: "Browser", action: nil, keyEquivalent: "")
     browserItem.submenu = buildBrowserMenu()
@@ -122,8 +133,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     UserDefaults.standard.set(enabled, forKey: chatGPTEnabledKey)
     sender.state = enabled ? .on : .off
     // Reflect the new state immediately (off hides ChatGPT; on shows "Sign in"
-    // until a scrape lands), then re-scrape to start/stop the ChatGPT fetch.
-    scraper.refreshChatGPTStatus()
+    // until a scrape lands), then re-scrape to start/stop the browser pass.
+    scraper.refreshProviderStatuses()
+    if let d = scraper.read() { panelModel.usage = d }
+    WidgetCenter.shared.reloadAllTimelines()
+    load()
+  }
+
+  @objc private func toggleClaude(_ sender: NSMenuItem) {
+    let enabled = !UserDefaults.standard.bool(forKey: claudeEnabledKey)
+    UserDefaults.standard.set(enabled, forKey: claudeEnabledKey)
+    sender.state = enabled ? .on : .off
+    scraper.refreshProviderStatuses()
     if let d = scraper.read() { panelModel.usage = d }
     WidgetCenter.shared.reloadAllTimelines()
     load()
@@ -171,15 +192,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc private func loadTick() { load() }
 
-  // Scraper posts kChatGPTDone once the background Playwright scrape finishes.
-  @objc private func chatGPTDone() {
-    log.info("kChatGPTDone: refreshing panel + widget")
+  // Scraper posts kBrowserScrapeDone once the background Playwright pass finishes.
+  @objc private func browserScrapeDone() {
+    log.info("kBrowserScrapeDone: refreshing panel + widget")
     if let d = scraper.read() { panelModel.usage = d }
     panelModel.isRefreshing = false
     WidgetCenter.shared.reloadAllTimelines()
   }
 
   func load() {
+    guard !loadInFlight else {
+      log.notice("load() skipped: previous cycle still running")
+      return
+    }
+    loadInFlight = true
     log.info("load() called")
     panelModel.isRefreshing = true
     panelModel.isLoading = true
@@ -203,11 +229,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log.notice("load(): scrape returned nil but cached data exists, keeping stale")
       }
       panelModel.isLoading = false
-      // The ChatGPT background scrape clears isRefreshing via kChatGPTDone; if
-      // this cycle didn't hand off to one (ChatGPT off, nothing to scrape, or a
-      // scrape already running), clear the flag ourselves or the panel spins
+      // The browser pass clears isRefreshing via kBrowserScrapeDone; if this
+      // cycle didn't hand off to one (both providers off, nothing to scrape, or
+      // one already running), clear the flag ourselves or the panel spins
       // forever on a stuck "Refreshing...".
-      if !outcome.spawnedChatGPTScrape { panelModel.isRefreshing = false }
+      if !outcome.spawnedBrowserPass { panelModel.isRefreshing = false }
+      loadInFlight = false
     }
   }
 

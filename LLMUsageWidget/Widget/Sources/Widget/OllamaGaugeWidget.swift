@@ -2,10 +2,9 @@ import WidgetKit
 import SwiftUI
 
 // Two widgets, no runtime toggle: the family you add in Notification Center
-// decides what's shown. "Ollama" is medium (Ollama only); "Ollama + ChatGPT"
-// is large (both providers). The host scrapes ChatGPT only when the large
-// widget is installed (Scraper.isChatGPTWidgetInstalled), so adding/removing
-// a widget is the single source of truth for both display and scraping.
+// decides what's shown. "Ollama" is medium (Ollama only); "Ollama + ChatGPT +
+// Claude" is large. The host scrapes the browser providers only while their
+// menu-bar switches are on, and one Playwright pass serves both.
 //
 // Both render cached usage from the shared App Group container; the host pushes
 // updates via WidgetCenter.reloadAllTimelines. The 300s timeline policy is only
@@ -64,28 +63,19 @@ struct OllamaChatGPTWidget: Widget {
         .containerBackground(for: .widget) { GlassPanelBackground() }
         .widgetURL(URL(string: "https://ollama.com/settings"))
     }
-    .configurationDisplayName("Ollama + ChatGPT")
-    .description("Ollama and ChatGPT Codex usage at a glance.")
+    .configurationDisplayName("Ollama + ChatGPT + Claude")
+    .description("Ollama, ChatGPT Codex, and Claude weekly usage at a glance.")
     .supportedFamilies([.systemLarge])
   }
 }
 
-private struct PanelView: View {
+struct PanelView: View {
   let entry: UsageEntry
   let showChatGPT: Bool
   let ringSize: CGFloat
   private var o: OllamaData? { entry.usage?.ollama }
   private var c: ChatGPTData? { entry.usage?.chatgpt }
-
-  // Only the meters OpenAI still exposes. A meter parsed as nil (e.g. the
-  // 5-hour limit they dropped) yields no card rather than a fake 0% ring.
-  private var chatGPTCards: [(pct: Double, resets: String)] {
-    guard let c else { return [] }
-    var cards: [(pct: Double, resets: String)] = []
-    if let pct = c.fiveHourPct { cards.append((pct, c.fiveHourReset ?? "")) }
-    if let pct = c.weeklyPct { cards.append((pct, c.weeklyReset ?? "")) }
-    return cards
-  }
+  private var cl: ClaudeData? { entry.usage?.claude }
 
   // No manual edge padding: WidgetKit already insets content by its default
   // 16pt content margin. The dark panel (containerBackground) fills edge to
@@ -97,14 +87,20 @@ private struct PanelView: View {
         Text("Usage").font(.system(size: 13, weight: .semibold)).foregroundColor(GlassTheme.title)
           .shadow(color: GlassTheme.textShadow, radius: 1, y: 1)
         Spacer()
-        if let last = entry.usage?.lastUpdated {
-          Text("Updated \(last)").font(.system(size: 9.5)).foregroundColor(GlassTheme.secondaryText)
-            .monospacedDigit().lineLimit(1)
+        VStack(alignment: .trailing, spacing: 1) {
+          if let last = entry.usage?.headerUpdatedText(includeBrowserProviders: showChatGPT) {
+            Text("Updated \(last)").font(.system(size: 9.5)).foregroundColor(GlassTheme.secondaryText)
+              .monospacedDigit().lineLimit(1)
+          }
+          if let note = entry.usage?.providerFailureNote(includeBrowserProviders: showChatGPT) {
+            Text(note).font(.system(size: 8.5, weight: .medium)).foregroundColor(.orange)
+              .lineLimit(1).minimumScaleFactor(0.8)
+          }
         }
       }
 
       if let usage = entry.usage {
-        switch usage.resolvedOllamaStatus {
+        switch usage.ollamaDisplayStatus {
         case .on:
           if let o {
             // Ollama-only widget drops the redundant "Ollama" header (the widget
@@ -117,38 +113,78 @@ private struct PanelView: View {
         case .unavailable:
           ProviderIndicator(
             title: "Ollama", message: "Sign in to Ollama", ringSize: ringSize, showTitle: showChatGPT)
+        case .stale:
+          ProviderIndicator(
+            title: "Ollama", message: "Not updating", detail: usage.ollamaStaleDetail,
+            severity: .elevated, ringSize: ringSize, showTitle: showChatGPT)
         }
       }
       if showChatGPT {
         SectionDivider()
-        switch entry.usage?.chatgptStatus ?? .off {
-        case .on:
-          ProviderColumn(title: "ChatGPT", cards: chatGPTCards, ringSize: ringSize, showTitle: true)
-        case .off:
-          ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
-        case .unavailable:
-          // No data at all. A scrape issue (launch failure, parse failure)
-          // explains why; only a clean not-signed-in (issue nil) is a sign-in
-          // prompt.
-          if let issue = entry.usage?.chatgptIssue {
-            ProviderIndicator(
-              title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
-              ringSize: ringSize)
-          } else {
-            ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
-          }
-        case .stale:
-          // The last numbers are still on disk, but a frozen ring is worse than
-          // no ring: drop the gauges and say when they stopped and why.
-          ProviderIndicator(
-            title: "ChatGPT", message: "Not updating",
-            detail: entry.usage?.chatgptStaleDetail ?? [], severity: .elevated,
-            ringSize: ringSize)
+        // The two browser providers share one row, half each, and show only the
+        // 7-day meter.
+        HStack(alignment: .top, spacing: 10) {
+          chatGPTSlot.frame(maxWidth: .infinity)
+          claudeSlot.frame(maxWidth: .infinity)
         }
       }
       if entry.usage == nil {
         Text("No data yet").font(.system(size: 12)).foregroundColor(GlassTheme.secondaryText)
       }
+    }
+  }
+
+  @ViewBuilder private var chatGPTSlot: some View {
+    switch entry.usage?.chatGPTDisplayStatus ?? .off {
+    case .on:
+      if let pct = c?.weeklyPct {
+        ProviderColumn(
+          title: "ChatGPT", cards: [(pct, c?.weeklyReset ?? "")], ringSize: ringSize)
+      } else {
+        ProviderIndicator(title: "ChatGPT", message: "No weekly meter", ringSize: ringSize)
+      }
+    case .off:
+      ProviderIndicator(title: "ChatGPT", message: "ChatGPT off", ringSize: ringSize)
+    case .unavailable:
+      // A scrape issue explains why; only a clean not-signed-in (issue nil) is
+      // a sign-in prompt.
+      if let issue = entry.usage?.chatgptIssue {
+        ProviderIndicator(
+          title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
+          ringSize: ringSize)
+      } else {
+        ProviderIndicator(title: "ChatGPT", message: "Sign in to ChatGPT", ringSize: ringSize)
+      }
+    case .stale:
+      ProviderIndicator(
+        title: "ChatGPT", message: "Not updating",
+        detail: entry.usage?.chatgptStaleDetail ?? [], severity: .elevated, ringSize: ringSize)
+    }
+  }
+
+  @ViewBuilder private var claudeSlot: some View {
+    switch entry.usage?.claudeDisplayStatus ?? .off {
+    case .on:
+      if let pct = cl?.weeklyPct {
+        ProviderColumn(
+          title: "Claude", cards: [(pct, cl?.weeklyReset ?? "")], ringSize: ringSize)
+      } else {
+        ProviderIndicator(title: "Claude", message: "No weekly meter", ringSize: ringSize)
+      }
+    case .off:
+      ProviderIndicator(title: "Claude", message: "Claude off", ringSize: ringSize)
+    case .unavailable:
+      if let issue = entry.usage?.claudeIssue {
+        ProviderIndicator(
+          title: "Claude", message: "Not updating", detail: [issue], severity: .elevated,
+          ringSize: ringSize)
+      } else {
+        ProviderIndicator(title: "Claude", message: "Sign in to Claude", ringSize: ringSize)
+      }
+    case .stale:
+      ProviderIndicator(
+        title: "Claude", message: "Not updating",
+        detail: entry.usage?.claudeStaleDetail ?? [], severity: .elevated, ringSize: ringSize)
     }
   }
 }
@@ -169,7 +205,9 @@ private struct ProviderColumn: View {
           UsageCard(pct: cards[i].pct, resets: cards[i].resets, ringSize: ringSize)
         }
       }
+      .frame(maxWidth: .infinity)
     }
+    .frame(maxWidth: .infinity)
   }
 }
 

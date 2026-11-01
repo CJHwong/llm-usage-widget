@@ -1,13 +1,15 @@
 # Ollama Gauge
 
-A macOS menu-bar app that scrapes Ollama and ChatGPT Codex usage and shows it in two places: real Notification Center widgets and a floating desktop panel. It reuses your browser's existing login session, so there's nothing extra to authenticate.
+A macOS menu-bar app that scrapes Ollama, ChatGPT Codex, and Claude usage and shows it in two places: real Notification Center widgets and a floating desktop panel. It reuses your browser's existing login session, so there's nothing extra to authenticate.
 
 The app is split in two:
 
-- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `usage.json` into a shared App Group container, tells the widgets to reload, and optionally draws the floating desktop panel (transparent over the wallpaper, which a widget can't be). Its menu bar has **Show Desktop Panel** and **Enable ChatGPT** toggles and a **Browser** source picker.
-- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads that same App Group container and renders two widgets: **Ollama** (medium) and **Ollama + ChatGPT** (large). The host is unsandboxed and the widget is sandboxed, but both reach the group container, so there's one copy of the data and no mirroring.
+- **Host app** (`Ollama Gauge.app`): unsandboxed menu-bar accessory. It scrapes every 5 minutes (Playwright/curl + browser cookies), writes `usage.json` into a shared App Group container, tells the widgets to reload, and optionally draws the floating desktop panel (transparent over the wallpaper, which a widget can't be). Its menu bar has **Show Desktop Panel**, **Enable ChatGPT**, **Enable Claude** toggles and a **Browser** source picker.
+- **Widget extension** (`OllamaGaugeWidget.appex`): sandboxed WidgetKit extension. It reads that same App Group container and renders two widgets: **Ollama** (medium) and **Ollama + ChatGPT + Claude** (large). The host is unsandboxed and the widget is sandboxed, but both reach the group container, so there's one copy of the data and no mirroring.
 
-ChatGPT is a single master switch in the menu bar. When it's off (or you're not signed in), the desktop panel hides the ChatGPT section and the large widget shows a "ChatGPT off" / "Sign in to ChatGPT" indicator.
+ChatGPT and Claude share one Playwright pass. Each has its own menu-bar switch. When a switch is off (or you're not signed in), that provider's half of the large widget shows "ChatGPT off" / "Sign in to ChatGPT", and the desktop panel shows the same quiet state.
+
+The header shows the newest successful read across all sources. If a fetch fails, a second line names the source ("Claude not updating") while the last good number stays on screen. After 15 minutes the card stops showing the number and says "Not updating" with the last read time and the reason.
 
 ## Tutorial: first run
 
@@ -36,7 +38,7 @@ Stop with `launchctl bootout gui/$(id -u)/com.llmwidget`. Restart with `launchct
 
 Only one instance runs at a time (guarded by an `instance.lock` in the App Group container), so launching the app by hand while the LaunchAgent owns it is a no-op.
 
-### Enable ChatGPT Codex usage
+### Enable ChatGPT Codex or Claude usage
 
 First install the scrape prerequisites:
 
@@ -44,7 +46,9 @@ First install the scrape prerequisites:
 playwright-cli install-browser firefox
 ```
 
-Then toggle **Enable ChatGPT** in the menu bar. That's the master switch: it gates the (expensive) ChatGPT scrape and drives the display everywhere. Turn it off the same way; the desktop panel and widget update on the next scrape. If you turn it on but aren't signed in to ChatGPT in your browser, the large widget shows "Sign in to ChatGPT".
+Then toggle **Enable ChatGPT** or **Enable Claude** in the menu bar. Each switch gates the (expensive) browser scrape for that provider. Both providers share one Playwright launch, so turning either on runs the same pass. Turn a switch off the same way; the panel and widget update on the next scrape. If a switch is on but that site is not signed in, the large widget shows "Sign in to ChatGPT" or "Sign in to Claude".
+
+Claude reads the `usage` response of the `claude.ai` settings page, and takes only the weekly (`weekly_all`) meter. `claude.ai` sits behind Cloudflare, which sometimes rejects a headless browser. The app retries once, keeps the last good number, and marks it "Not updating" after 15 minutes.
 
 ### If the widget does not appear in the gallery
 

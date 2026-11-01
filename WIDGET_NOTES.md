@@ -58,24 +58,56 @@ Two-process design, matching the proven `context-bar` / `CodexBar` pattern:
 The widget surface is a `WidgetBundle` with two widgets:
 
 - **"Ollama"** - `.systemMedium`, Ollama only.
-- **"Ollama + ChatGPT"** - `.systemLarge`, both providers.
+- **"Ollama + ChatGPT + Claude"** - `.systemLarge`, Ollama plus a paired
+  ChatGPT/Claude row, half each, weekly meter only.
 
 The family added in Notification Center decides both what's shown and its size,
 so the frame always matches the content (a widget can't resize its own height).
 
-### ChatGPT control
+### Provider controls
 
-ChatGPT scraping is expensive (Playwright + Firefox), so it's gated on a single
-master switch: the **Enable ChatGPT** menu-bar item, persisted in the host's
-`UserDefaults` (`chatGPTEnabledKey`). The host scrapes ChatGPT only when it's on.
+Browser scraping is expensive (Playwright + Firefox), so each provider has its
+own menu-bar switch: **Enable ChatGPT** and **Enable Claude**, persisted in the
+host's `UserDefaults` (`chatGPTEnabledKey`, `claudeEnabledKey`). When either is
+on, the host starts one browser pass that serves both.
 
 The sandboxed widget can't read host `UserDefaults`, so the host computes a
-derived `ChatGPTStatus` (`on` / `off` / `unavailable`) and writes it into
-`usage.json` (`chatgpt_status`). All three surfaces read that one status:
+derived `ProviderStatus` (`on` / `off` / `unavailable` / `stale`) and writes it
+into `usage.json` (`chatgpt_status`, `claude_status`). All three surfaces read
+those statuses:
 
-- desktop panel: shows the ChatGPT section only when `on`, else hides it (reflows);
-- large widget: `on` -> gauges, `off` -> "ChatGPT off", `unavailable` -> "Sign in to ChatGPT";
-- `unavailable` = enabled but no data (not signed in / scrape failing).
+- desktop panel: the paired row shows both halves; a provider that is off shows
+  a quiet "off" state in its half;
+- large widget: `on` -> a gauge, `off` -> "<provider> off", `unavailable` ->
+  "Sign in to <provider>", `stale` -> "Not updating" with the last read time
+  and the reason;
+- `stale` = we hold numbers but the last successful read is older than 15
+  minutes, whether or not a failure was recorded. A dead scrape loop can no
+  longer look live.
+
+The header prints the newest successful read (`headerUpdatedText`, derived from
+the three provider timestamps, not the cycle stamp). When a fetch fails, a
+second line names the source (`providerFailureNote`, e.g. "Claude not
+updating") while the last good number stays on screen. The card still carries
+the reason in its stale detail. Both the widget and the panel render this from
+the shared `UsageData`, so a frozen value can never look current.
+
+### Child-process deadline
+
+`ProcessRunner` owns every curl deadline. curl's `--max-time` is advisory: a
+stalled HTTP/2 read ignored it for 11 hours in the field and hung the app. The
+runner drains both pipes, waits on a utility queue, and escalates `terminate()`
+to `SIGKILL` at the deadline. `AppDelegate.load()` also refuses to start a cycle
+while the previous one is still running.
+
+### Claude capture
+
+`claude.ai` renders from `GET /api/organizations/<org>/usage`. The scrape loads
+`https://claude.ai/new#settings/usage` in a second Playwright page and captures
+that response only when it is a 200. It reads `limits[kind == weekly_all]`
+(`percent`, `resets_at`), falling back to `seven_day`. Plain curl gets a
+Cloudflare 403, and headless Firefox is intermittent, so the capture retries once
+and ages the last good number into `stale`.
 
 (Earlier iterations gated on a `chatgpt_enabled` container file and then on
 `WidgetCenter.getCurrentConfigurations`; the menu toggle replaced both as a
@@ -171,7 +203,7 @@ primary driver, so the 40-70/day widget budget is never stressed.
 3. Bump `CURRENT_PROJECT_VERSION` in `project.yml` if you need the *gallery
    preview* to re-render (caveat #2). Remove stray appex copies before judging
    (caveat #4).
-4. Add the **Ollama** or **Ollama + ChatGPT** widget from Notification Center /
+4. Add the **Ollama** or **Ollama + ChatGPT + Claude** widget from Notification Center /
    Edit Widgets. If a widget does not appear, run the troubleshooting block in
    `README.md` (`pluginkit -a`, `chronod` logs). If the icon is missing, expect
    to need a logout/login (caveat #7).

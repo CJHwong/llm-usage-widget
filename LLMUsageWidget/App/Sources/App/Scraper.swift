@@ -4,13 +4,13 @@ import OSLog
 private let log = Logger(subsystem: "com.llmwidget", category: "scraper")
 
 // What a scrape cycle hands back to load(): the fresh data plus whether this
-// cycle started a background ChatGPT scrape. That background pass is what posts
-// kChatGPTDone, which clears the panel's isRefreshing; when it wasn't started
-// (ChatGPT off, nothing to scrape, or one already running), load() must clear
-// the flag itself or the panel spins forever.
+// cycle started a background browser pass. That pass is what posts
+// kBrowserScrapeDone, which clears the panel's isRefreshing; when it wasn't
+// started (both providers off, nothing to scrape, or one already running),
+// load() must clear the flag itself or the panel spins forever.
 struct ScrapeOutcome {
   let usage: UsageData?
-  let spawnedChatGPTScrape: Bool
+  let spawnedBrowserPass: Bool
 }
 
 final class Scraper: @unchecked Sendable {
@@ -25,7 +25,7 @@ final class Scraper: @unchecked Sendable {
   }()
   private let _lock = NSLock()
   private var _lastIssueMessage: String?
-  private var _isScrapingChatGPT = false
+  private var _isRunningBrowserPass = false
 
   // Namespaces every Playwright session this app opens, so the startup reaper
   // can recognize its own leftovers without touching unrelated sessions the
@@ -59,29 +59,39 @@ final class Scraper: @unchecked Sendable {
   // host writes into usage.json.
   private var chatGPTEnabled: Bool { UserDefaults.standard.bool(forKey: chatGPTEnabledKey) }
 
-  // How long a failing ChatGPT scrape may keep its last numbers before the UI
-  // has to call them stale. Three missed 300s cycles: rides out a hiccup, but
-  // can never let a number sit there for days looking live.
-  private static let staleAfter: TimeInterval = 15 * 60
+  // The Claude switch. Browser scraping is the expensive part, so each provider
+  // has its own gate; one background pass serves both.
+  private var claudeEnabled: Bool { UserDefaults.standard.bool(forKey: claudeEnabledKey) }
 
-  private func chatGPTStatus(
-    enabled: Bool, data: ChatGPTData?, updatedAt: Date?, failing: Bool
-  ) -> ChatGPTStatus {
+  // How long a failing scrape may keep its last numbers before the UI has to
+  // call them stale. The UI re-applies the same cutoff at render time.
+  private static let staleAfter = UsageData.staleAfter
+
+  private func providerStatus(
+    enabled: Bool, data: Bool, updatedAt: Date?
+  ) -> ProviderStatus {
     if !enabled { return .off }
-    guard data != nil else { return .unavailable }
-    guard failing else { return .on }
-    // Numbers of unknown age plus a live failure: no basis to call them fresh.
+    guard data else { return .unavailable }
     guard let updatedAt else { return .stale }
     return Date().timeIntervalSince(updatedAt) > Self.staleAfter ? .stale : .on
   }
 
-  // Rewrite usage.json's chatgptStatus from the current toggle + cached data,
-  // without scraping, so a menu toggle reflects in the widget/panel immediately.
-  func refreshChatGPTStatus() {
+  private func ollamaStatus(data: OllamaData?, updatedAt: Date?) -> OllamaStatus {
+    guard data != nil else { return .unavailable }
+    guard let updatedAt else { return .stale }
+    return Date().timeIntervalSince(updatedAt) > Self.staleAfter ? .stale : .on
+  }
+
+  // Rewrite usage.json's provider statuses from the current toggles + cached
+  // data, without scraping, so a menu toggle reflects in the widget/panel
+  // immediately.
+  func refreshProviderStatuses() {
     guard var d = read() else { return }
-    d.chatgptStatus = chatGPTStatus(
-      enabled: chatGPTEnabled, data: d.chatgpt, updatedAt: d.chatgptUpdatedAt,
-      failing: d.chatgptIssue != nil)
+    d.chatgptStatus = providerStatus(
+      enabled: chatGPTEnabled, data: d.chatgpt != nil, updatedAt: d.chatgptUpdatedAt)
+    d.claudeStatus = providerStatus(
+      enabled: claudeEnabled, data: d.claude != nil, updatedAt: d.claudeUpdatedAt)
+    d.ollamaStatus = ollamaStatus(data: d.ollama, updatedAt: d.ollamaUpdatedAt)
     write(d)
   }
 
@@ -97,14 +107,33 @@ final class Scraper: @unchecked Sendable {
   func scrape() async -> ScrapeOutcome {
     log.info("scrape() started")
     let wantChatGPT = chatGPTEnabled
+    let wantClaude = claudeEnabled
     let preflight = preflightMessage()
     _lock.withLock { _lastIssueMessage = preflight }
+    let fmt = Self.timeFmt
     guard let browser = BrowserRegistry.firstSupportedProfile() else {
       log.warning("No supported browser profile found")
-      return ScrapeOutcome(usage: nil, spawnedChatGPTScrape: false)
+      // A missing profile is a fetch failure for every source. Record it so the
+      // header says so instead of freezing on the last good numbers.
+      var d = read() ?? UsageData()
+      let issue = "No browser profile found"
+      d.ollamaIssue = issue
+      d.ollamaStatus = ollamaStatus(data: d.ollama, updatedAt: d.ollamaUpdatedAt)
+      if wantChatGPT {
+        d.chatgptIssue = issue
+        d.chatgptStatus = providerStatus(
+          enabled: true, data: d.chatgpt != nil, updatedAt: d.chatgptUpdatedAt)
+      }
+      if wantClaude {
+        d.claudeIssue = issue
+        d.claudeStatus = providerStatus(
+          enabled: true, data: d.claude != nil, updatedAt: d.claudeUpdatedAt)
+      }
+      d.lastUpdated = fmt.string(from: Date())
+      write(d)
+      return ScrapeOutcome(usage: read(), spawnedBrowserPass: false)
     }
     log.info("Found browser profile: \(browser.profile.browserName) at \(browser.profile.profilePath)")
-    let fmt = Self.timeFmt
 
     let ollamaCookies = browser.adapter.cookies(for: browser.profile, domains: ["ollama", "workos"])
     var merged = read() ?? UsageData()
@@ -113,88 +142,69 @@ final class Scraper: @unchecked Sendable {
     {
       log.info("Ollama scrape succeeded")
       merged.ollama = ollama
+      merged.ollamaUpdatedAt = Date()
+      merged.ollamaIssue = nil
       merged.ollamaStatus = .on
       // Back to the preflight baseline, not nil: Ollama working says nothing
-      // about whether ChatGPT's prerequisites are in place, and clearing the
-      // preflight text here is what hid a missing Playwright browser for days.
+      // about whether the browser providers' prerequisites are in place, and
+      // clearing the preflight text here is what hid a missing Playwright
+      // browser for days.
       _lock.withLock { _lastIssueMessage = preflight }
     } else if ollamaCookies.isEmpty {
       // Not signed in to Ollama in the selected browser: drop any stale numbers
       // (e.g. left over from another browser) so the panel shows the truth.
       log.warning("Ollama: no cookies in \(browser.profile.browserName)")
       merged.ollama = nil
+      merged.ollamaUpdatedAt = nil
+      merged.ollamaIssue = nil
       merged.ollamaStatus = .unavailable
       _lock.withLock {
         _lastIssueMessage = "Not signed in to Ollama in \(browser.profile.browserName)."
       }
     } else {
-      // Cookies exist but the fetch/parse failed (transient): keep the last good data.
+      // Cookies exist but the fetch/parse failed (transient): keep the last
+      // good data and let its timestamp decide whether it still reads live.
       log.warning("Ollama scrape failed despite cookies present")
-      merged.ollamaStatus = merged.ollama != nil ? .on : .unavailable
+      merged.ollamaIssue = "Fetch failed"
+      merged.ollamaStatus = ollamaStatus(
+        data: merged.ollama, updatedAt: merged.ollamaUpdatedAt)
       _lock.withLock {
         _lastIssueMessage =
           "Could not read Ollama usage from \(browser.profile.browserName). Check that you are signed in and the profile still has the required cookies."
       }
     }
     merged.lastUpdated = fmt.string(from: Date())
-    merged.chatgptStatus = chatGPTStatus(
-      enabled: wantChatGPT, data: merged.chatgpt, updatedAt: merged.chatgptUpdatedAt,
-      failing: merged.chatgptIssue != nil)
+    merged.chatgptStatus = providerStatus(
+      enabled: wantChatGPT, data: merged.chatgpt != nil, updatedAt: merged.chatgptUpdatedAt)
+    merged.claudeStatus = providerStatus(
+      enabled: wantClaude, data: merged.claude != nil, updatedAt: merged.claudeUpdatedAt)
     write(merged)
 
-    var spawnedChatGPTScrape = false
-    if wantChatGPT {
+    var spawnedBrowserPass = false
+    if wantChatGPT || wantClaude {
       let shouldScrape = _lock.withLock { () -> Bool in
-        if _isScrapingChatGPT { return false }
-        _isScrapingChatGPT = true
+        if _isRunningBrowserPass { return false }
+        _isRunningBrowserPass = true
         return true
       }
       if shouldScrape {
-        spawnedChatGPTScrape = true
-        log.info("ChatGPT enabled, starting ChatGPT scrape on background thread")
+        spawnedBrowserPass = true
+        log.info("Starting browser pass (chatgpt=\(wantChatGPT), claude=\(wantClaude))")
         DispatchQueue.global().async { [self, browser] in
-          defer { self._lock.withLock { self._isScrapingChatGPT = false } }
-          log.info("BG: scrapeChatGPT() called")
-          var d = self.read() ?? UsageData()
-          switch self.scrapeChatGPT(using: browser) {
-          case .success(let c):
-            d.chatgpt = c
-            d.chatgptUpdatedAt = Date()
-            d.chatgptIssue = nil
-            d.lastUpdated = fmt.string(from: Date())
-            d.chatgptStatus = .on
-            log.info("BG: ChatGPT data written, posting notification")
-          case .notSignedIn:
-            // Definitive logout: drop stale numbers and surface the sign-in
-            // prompt instead of freezing on the last good data.
-            log.warning("BG: ChatGPT not signed in")
-            d.chatgpt = nil
-            d.chatgptUpdatedAt = nil
-            d.chatgptIssue = nil
-            d.chatgptStatus = .unavailable
-          case .transientFailure(let reason):
-            // Fetch/parse hiccup: keep the last good data, but record why the
-            // refresh failed and let it age into `stale` so the UI stops
-            // presenting a frozen number as the current one.
-            d.chatgptIssue = reason
-            d.chatgptStatus = self.chatGPTStatus(
-              enabled: true, data: d.chatgpt, updatedAt: d.chatgptUpdatedAt, failing: true)
-            log.warning(
-              "BG: ChatGPT scrape failed: \(reason), status=\(d.chatgptStatus?.rawValue ?? "-")")
-          }
-          self.write(d)
+          defer { self._lock.withLock { self._isRunningBrowserPass = false } }
+          self.runBrowserPass(using: browser, wantChatGPT: wantChatGPT, wantClaude: wantClaude)
           DispatchQueue.main.async {
-            NotificationCenter.default.post(name: kChatGPTDone, object: nil)
+            NotificationCenter.default.post(name: kBrowserScrapeDone, object: nil)
           }
         }
       } else {
-        log.info("ChatGPT scrape already in progress, skipping")
+        log.info("Browser pass already in progress, skipping")
       }
     } else {
-      log.notice("ChatGPT disabled; skipping ChatGPT scrape")
+      log.notice("ChatGPT and Claude disabled; skipping browser pass")
     }
     log.info("scrape() returning")
-    return ScrapeOutcome(usage: read(), spawnedChatGPTScrape: spawnedChatGPTScrape)
+    return ScrapeOutcome(usage: read(), spawnedBrowserPass: spawnedBrowserPass)
   }
 
   private func scrapeOllama(cookies: String) async -> OllamaData? {
@@ -252,14 +262,19 @@ final class Scraper: @unchecked Sendable {
     )
   }
 
-  // Outcome of a ChatGPT scrape. `notSignedIn` is a definitive auth failure that
-  // should clear stale data; `transientFailure` is a hiccup worth keeping the
-  // last good data for.
+  // Outcome of a ChatGPT scrape. The cookie check happens before the browser
+  // opens, so this only carries success or a transient failure.
   private enum ChatGPTScrapeOutcome {
     case success(ChatGPTData)
-    case notSignedIn
     // Carries a short reason the widget prints verbatim, so keep it to a few
     // words. The verbose remediation text stays in _lastIssueMessage.
+    case transientFailure(String)
+  }
+
+  // Same shape, without a not-signed-in case: the cookie check happens before
+  // the browser opens.
+  private enum ClaudeScrapeOutcome {
+    case success(ClaudeData)
     case transientFailure(String)
   }
 
@@ -282,6 +297,30 @@ final class Scraper: @unchecked Sendable {
         });
       } catch (e) { /* a slow load can still have fired the request */ }
       for (let i = 0; i < 20 && captured === null; i++) await page.waitForTimeout(500);
+      return JSON.stringify(captured);
+    }
+    """
+
+  // claude.ai fetches the same numbers the settings page renders from
+  // /api/organizations/<org>/usage. A fresh page (not the ChatGPT one) keeps the
+  // two captures independent. Only a 200 is accepted: Cloudflare answers the
+  // challenged request with a 403 HTML page, which must not be parsed.
+  private static let claudeCaptureScript = """
+    async (page) => {
+      let captured = null;
+      const p = await page.context().newPage();
+      p.on('response', async (res) => {
+        if (!res.url().includes('/api/organizations/') || !res.url().includes('/usage')) return;
+        if (res.status() !== 200) return;
+        try { captured = await res.json(); } catch (e) { /* not JSON */ }
+      });
+      try {
+        await p.goto('https://claude.ai/new#settings/usage', {
+          waitUntil: 'domcontentloaded', timeout: 25000,
+        });
+      } catch (e) { /* a slow load can still have fired the request */ }
+      for (let i = 0; i < 24 && captured === null; i++) await p.waitForTimeout(500);
+      await p.close();
       return JSON.stringify(captured);
     }
     """
@@ -313,6 +352,37 @@ final class Scraper: @unchecked Sendable {
     }
   }
 
+  // The slice of /api/organizations/<org>/usage we read. `limits` is the
+  // structured view the settings page renders; `seven_day` is the older
+  // account-level meter and serves as a fallback. Unknown keys are ignored.
+  private struct ClaudeUsageResponse: Decodable {
+    let limits: [Limit]?
+    let sevenDay: Window?
+    enum CodingKeys: String, CodingKey {
+      case limits
+      case sevenDay = "seven_day"
+    }
+
+    struct Limit: Decodable {
+      let kind: String?
+      let percent: Double?
+      let resetsAt: String?
+      enum CodingKeys: String, CodingKey {
+        case kind, percent
+        case resetsAt = "resets_at"
+      }
+    }
+
+    struct Window: Decodable {
+      let utilization: Double?
+      let resetsAt: String?
+      enum CodingKeys: String, CodingKey {
+        case utilization
+        case resetsAt = "resets_at"
+      }
+    }
+  }
+
   // Why a Playwright launch most likely failed, in UI-sized words. Checks the
   // two prerequisites we can verify locally before falling back to the daemon's
   // own stderr, because "Playwright would not launch" is useless on its own and
@@ -333,66 +403,167 @@ final class Scraper: @unchecked Sendable {
     return "Playwright would not launch"
   }
 
-  private func scrapeChatGPT(using browser: BrowserSelection) -> ChatGPTScrapeOutcome {
-    log.info("scrapeChatGPT() START")
-    log.info("scrapeChatGPT: using \(browser.profile.browserName) profile at \(browser.profile.profilePath)")
-
+  // One Playwright browser serves both providers: open once, load the cookies,
+  // then run each capture independently. A ChatGPT failure must not cost the
+  // Claude number, and vice versa.
+  private func runBrowserPass(
+    using browser: BrowserSelection, wantChatGPT: Bool, wantClaude: Bool
+  ) {
+    log.info("runBrowserPass: chatgpt=\(wantChatGPT) claude=\(wantClaude)")
     // Inject cookies through a Playwright storage_state instead of copying the
     // browser profile: Chromium can't decrypt Chrome's cookie DB (different Safe
     // Storage key), so we hand Playwright already-decrypted cookies. This works
     // uniformly for Chrome and Firefox.
-    let cookies = browser.adapter.cookies(for: browser.profile, domains: ["chatgpt", "openai"])
-    // The NextAuth session-token cookie is the auth signal. Logging out deletes
-    // it while leaving cf_clearance/csrf behind, so checking it here is more
-    // reliable than scraping the page — a logged-out hit just stalls on
-    // Cloudflare's "Just a moment..." wall and never yields a login page.
-    let signedIn = cookies.contains { $0.name.contains("session-token") }
-    guard signedIn, let stateData = storageStateData(from: cookies) else {
-      log.warning("scrapeChatGPT: no ChatGPT session-token cookie in \(browser.profile.browserName)")
+    let cookies = browser.adapter.cookies(
+      for: browser.profile, domains: ["chatgpt", "openai", "claude"])
+    // Logging out deletes the session cookie while leaving cf_clearance behind,
+    // so checking it here is more reliable than scraping the page: a logged-out
+    // hit just stalls on Cloudflare's "Just a moment..." wall.
+    let chatSignedIn = cookies.contains { $0.name.contains("session-token") }
+    let claudeSignedIn = cookies.contains {
+      $0.name == "sessionKey" || $0.name == "sessionKeyV3"
+    }
+    let chatNeedsScrape = wantChatGPT && chatSignedIn
+    let claudeNeedsScrape = wantClaude && claudeSignedIn
+
+    var d = read() ?? UsageData()
+    if wantChatGPT && !chatSignedIn {
+      log.warning("runBrowserPass: no ChatGPT session-token cookie")
       _lock.withLock {
         _lastIssueMessage =
           "No ChatGPT session found in \(browser.profile.browserName). Sign in to ChatGPT in that browser."
       }
-      return .notSignedIn
+      d.chatgpt = nil
+      d.chatgptUpdatedAt = nil
+      d.chatgptIssue = nil
+      d.chatgptStatus = .unavailable
+    }
+    if wantClaude && !claudeSignedIn {
+      log.warning("runBrowserPass: no Claude sessionKey cookie")
+      _lock.withLock {
+        _lastIssueMessage =
+          "No Claude session found in \(browser.profile.browserName). Sign in to Claude in that browser."
+      }
+      d.claude = nil
+      d.claudeUpdatedAt = nil
+      d.claudeIssue = nil
+      d.claudeStatus = .unavailable
+    }
+    guard chatNeedsScrape || claudeNeedsScrape else {
+      write(d)
+      return
+    }
+    guard let stateData = storageStateData(from: cookies) else {
+      failBoth(&d, chat: chatNeedsScrape, claude: claudeNeedsScrape,
+               reason: "Could not stage the browser session")
+      write(d)
+      return
     }
 
     let tmpDir = URL(fileURLWithPath: "/tmp/pwt-\(ProcessInfo.processInfo.globallyUniqueString)")
     let stateFile = tmpDir.appendingPathComponent("state.json")
     let sessionName = "\(Self.sessionPrefix)\(ProcessInfo.processInfo.globallyUniqueString)"
-    log.info("scrapeChatGPT: tmpDir=\(tmpDir.path) session=\(sessionName)")
+    log.info("runBrowserPass: tmpDir=\(tmpDir.path) session=\(sessionName)")
     try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-    guard (try? stateData.write(to: stateFile)) != nil else {
-      log.error("scrapeChatGPT: failed to write storage_state")
-      try? FileManager.default.removeItem(at: tmpDir)
-      return .transientFailure("Could not stage the ChatGPT session")
-    }
     defer {
-      log.info("scrapeChatGPT: cleanup - closing session")
+      log.info("runBrowserPass: cleanup - closing session")
       closePlaywrightSession(sessionName)
       try? FileManager.default.removeItem(at: tmpDir)
     }
+    guard (try? stateData.write(to: stateFile)) != nil else {
+      log.error("runBrowserPass: failed to write storage_state")
+      failBoth(&d, chat: chatNeedsScrape, claude: claudeNeedsScrape,
+               reason: "Could not stage the browser session")
+      write(d)
+      return
+    }
 
-    // open a blank context, load the cookies, then navigate authenticated.
+    // Open a blank context, load the cookies, then navigate authenticated.
     let openResult = runPlaywrightCommand(
       ["-s=\(sessionName)", "open", "--browser", browser.adapter.playwrightBrowserName, "about:blank"],
       timeout: 30)
     guard openResult.output != nil else {
       let issue = playwrightLaunchIssue(
         for: browser.adapter.playwrightBrowserName, stderr: openResult.stderr)
-      log.error("scrapeChatGPT: open failed (\(issue))")
-      _lock.withLock {
-        _lastIssueMessage = preflightMessage() ?? "Could not launch Playwright for ChatGPT."
-      }
-      return .transientFailure(issue)
+      log.error("runBrowserPass: open failed (\(issue))")
+      _lock.withLock { _lastIssueMessage = preflightMessage() ?? "Could not launch Playwright." }
+      failBoth(&d, chat: chatNeedsScrape, claude: claudeNeedsScrape, reason: issue)
+      write(d)
+      return
     }
     guard runPlaywrightCommand(["-s=\(sessionName)", "state-load", stateFile.path]).output != nil else {
-      log.error("scrapeChatGPT: state-load failed")
-      return .transientFailure("Could not load the ChatGPT session")
+      log.error("runBrowserPass: state-load failed")
+      failBoth(&d, chat: chatNeedsScrape, claude: claudeNeedsScrape,
+               reason: "Could not load the browser session")
+      write(d)
+      return
     }
-    let scriptFile = tmpDir.appendingPathComponent("capture-usage.js")
+
+    if chatNeedsScrape {
+      apply(captureChatGPT(sessionName: sessionName, tmpDir: tmpDir), to: &d)
+    }
+    if claudeNeedsScrape {
+      apply(captureClaude(sessionName: sessionName, tmpDir: tmpDir), to: &d)
+    }
+    d.lastUpdated = Self.timeFmt.string(from: Date())
+    write(d)
+  }
+
+  private func failBoth(
+    _ d: inout UsageData, chat: Bool, claude: Bool, reason: String
+  ) {
+    if chat {
+      d.chatgptIssue = reason
+      d.chatgptStatus = providerStatus(
+        enabled: true, data: d.chatgpt != nil, updatedAt: d.chatgptUpdatedAt)
+    }
+    if claude {
+      d.claudeIssue = reason
+      d.claudeStatus = providerStatus(
+        enabled: true, data: d.claude != nil, updatedAt: d.claudeUpdatedAt)
+    }
+  }
+
+  private func apply(_ outcome: ChatGPTScrapeOutcome, to d: inout UsageData) {
+    switch outcome {
+    case .success(let c):
+      d.chatgpt = c
+      d.chatgptUpdatedAt = Date()
+      d.chatgptIssue = nil
+      d.chatgptStatus = .on
+      log.info("BG: ChatGPT data written")
+    case .transientFailure(let reason):
+      // Keep the last good data, record why the refresh failed, and let the
+      // timestamp age it into `stale` so the UI stops presenting a frozen
+      // number as the current one.
+      d.chatgptIssue = reason
+      d.chatgptStatus = providerStatus(
+        enabled: true, data: d.chatgpt != nil, updatedAt: d.chatgptUpdatedAt)
+      log.warning("BG: ChatGPT scrape failed: \(reason)")
+    }
+  }
+
+  private func apply(_ outcome: ClaudeScrapeOutcome, to d: inout UsageData) {
+    switch outcome {
+    case .success(let c):
+      d.claude = c
+      d.claudeUpdatedAt = Date()
+      d.claudeIssue = nil
+      d.claudeStatus = .on
+      log.info("BG: Claude data written - weekly=\(c.weeklyPct)")
+    case .transientFailure(let reason):
+      d.claudeIssue = reason
+      d.claudeStatus = providerStatus(
+        enabled: true, data: d.claude != nil, updatedAt: d.claudeUpdatedAt)
+      log.warning("BG: Claude scrape failed: \(reason)")
+    }
+  }
+
+  private func captureChatGPT(sessionName: String, tmpDir: URL) -> ChatGPTScrapeOutcome {
+    let scriptFile = tmpDir.appendingPathComponent("capture-chatgpt.js")
     guard (try? Self.usageCaptureScript.write(to: scriptFile, atomically: true, encoding: .utf8)) != nil
     else {
-      log.error("scrapeChatGPT: failed to write the capture script")
+      log.error("captureChatGPT: failed to write the capture script")
       return .transientFailure("Could not stage the usage capture")
     }
 
@@ -402,7 +573,7 @@ final class Scraper: @unchecked Sendable {
       ["-s=\(sessionName)", "--raw", "run-code", "--filename", scriptFile.path],
       timeout: 40)
     guard let output = capture.output else {
-      log.error("scrapeChatGPT: run-code failed, stderr=\(capture.stderr)")
+      log.error("captureChatGPT: run-code failed, stderr=\(capture.stderr)")
       return .transientFailure("Could not read the usage API")
     }
 
@@ -412,15 +583,52 @@ final class Scraper: @unchecked Sendable {
       let response = try? JSONDecoder().decode(UsageResponse.self, from: Data(json.utf8)),
       let parsed = chatGPTData(from: response)
     else {
-      log.warning("scrapeChatGPT: capture held no usable usage window")
+      log.warning("captureChatGPT: capture held no usable usage window")
       _lock.withLock {
         _lastIssueMessage =
           "ChatGPT opened but reported no usage window. Check that you are signed in and still have Codex access."
       }
       return .transientFailure("No usage window reported")
     }
-    log.info("scrapeChatGPT: parsed successfully - 5h=\(String(describing: parsed.fiveHourPct)) weekly=\(String(describing: parsed.weeklyPct)) resets=[\(parsed.fiveHourReset ?? "-"), \(parsed.weeklyReset ?? "-")]")
+    log.info(
+      "captureChatGPT: parsed - 5h=\(String(describing: parsed.fiveHourPct)) weekly=\(String(describing: parsed.weeklyPct))")
     return .success(parsed)
+  }
+
+  private func captureClaude(sessionName: String, tmpDir: URL) -> ClaudeScrapeOutcome {
+    let scriptFile = tmpDir.appendingPathComponent("capture-claude.js")
+    guard
+      (try? Self.claudeCaptureScript.write(to: scriptFile, atomically: true, encoding: .utf8)) != nil
+    else {
+      log.error("captureClaude: failed to write the capture script")
+      return .transientFailure("Could not stage the Claude capture")
+    }
+
+    // Cloudflare let headless Firefox through intermittently in testing, so a
+    // null result gets one clean retry before the cycle gives up.
+    for attempt in 1...2 {
+      let capture = runPlaywrightCommand(
+        ["-s=\(sessionName)", "--raw", "run-code", "--filename", scriptFile.path],
+        timeout: 45)
+      guard let output = capture.output else {
+        log.error("captureClaude: run-code failed, stderr=\(capture.stderr)")
+        continue
+      }
+      guard let json = try? JSONDecoder().decode(String.self, from: Data(output.utf8)),
+        let response = try? JSONDecoder().decode(ClaudeUsageResponse.self, from: Data(json.utf8)),
+        let parsed = claudeData(from: response)
+      else {
+        log.warning("captureClaude: attempt \(attempt) held no usage window")
+        continue
+      }
+      log.info("captureClaude: parsed - weekly=\(parsed.weeklyPct) reset=\(parsed.weeklyReset)")
+      return .success(parsed)
+    }
+    _lock.withLock {
+      _lastIssueMessage =
+        "Claude opened but reported no usage. Cloudflare may have blocked the request."
+    }
+    return .transientFailure("Claude request blocked")
   }
 
   // The 5-hour window, in seconds. The API does not label its windows, so the
@@ -468,6 +676,31 @@ final class Scraper: @unchecked Sendable {
     return Self.formatResetInterval(interval)
   }
 
+  // Claude reports an ISO-8601 reset. Prefer the labelled weekly_all limit; fall
+  // back to the account-level seven_day meter if the limits array changes.
+  private func claudeData(from response: ClaudeUsageResponse) -> ClaudeData? {
+    let weekly = response.limits?.first { $0.kind == "weekly_all" }
+    guard let pct = weekly?.percent ?? response.sevenDay?.utilization else { return nil }
+    let resetISO = weekly?.resetsAt ?? response.sevenDay?.resetsAt
+    return ClaudeData(
+      weeklyPct: pct,
+      weeklyReset: resetISO.flatMap(resetText(iso:)) ?? "")
+  }
+
+  private func resetText(iso: String) -> String? {
+    // Formatters are not Sendable, so build them here instead of sharing statics.
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    guard let date = fractional.date(from: iso) ?? plain.date(from: iso) else {
+      return nil
+    }
+    let interval = date.timeIntervalSinceNow
+    guard interval > 0 else { return nil }
+    return Self.formatResetInterval(interval)
+  }
+
   private static func formatResetInterval(_ interval: TimeInterval) -> String {
     let minutes = Int(ceil(interval / 60))
     if minutes < 60 { return "Resets in \(minutes) minute\(minutes == 1 ? "" : "s")." }
@@ -478,33 +711,34 @@ final class Scraper: @unchecked Sendable {
 
   private func httpGet(_ url: String, cookie: String) async -> String? {
     log.info("httpGet: fetching \(url)")
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-    proc.arguments = [
+    let arguments = [
       "-sL", "--max-time", "15", "-H", "Cookie: \(cookie)",
       "-H",
       "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0",
       url,
     ]
-    let o = Pipe()
-    proc.standardOutput = o
-    proc.standardError = Pipe()
-    guard (try? proc.run()) != nil else {
-      log.error("httpGet: curl launch failed")
+    // Hop off the cooperative pool: the wait below parks a thread for up to 25s.
+    let result = await withCheckedContinuation { continuation in
+      DispatchQueue.global(qos: .utility).async {
+        continuation.resume(
+          returning: ProcessRunner.run(
+            executable: "/usr/bin/curl", arguments: arguments, timeout: 25))
+      }
+    }
+    if result.timedOut {
+      log.error("httpGet: killed curl after 25s")
       return nil
     }
-    proc.waitUntilExit()  // curl --max-time 15 provides the timeout
-    guard proc.terminationStatus == 0 else {
-      log.warning("httpGet: curl exit code \(proc.terminationStatus)")
+    guard result.status == 0 else {
+      log.warning("httpGet: curl exit code \(result.status)")
       return nil
     }
-    let result = String(data: o.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-    if let result {
-      log.info("httpGet: received \(result.count) bytes")
-    } else {
+    guard let text = String(data: result.stdout, encoding: .utf8) else {
       log.warning("httpGet: response not UTF-8")
+      return nil
     }
-    return result
+    log.info("httpGet: received \(text.count) bytes")
+    return text
   }
 
   func write(_ d: UsageData) {
@@ -547,15 +781,15 @@ final class Scraper: @unchecked Sendable {
     if !FileManager.default.isExecutableFile(atPath: "/usr/bin/curl") {
       issues.append("Missing required system binary: /usr/bin/curl.")
     }
-    if chatGPTEnabled {
+    if chatGPTEnabled || claudeEnabled {
       if !FileManager.default.isExecutableFile(atPath: playwrightCLI) {
-        issues.append("ChatGPT is enabled but playwright-cli is not installed.")
+        issues.append("A browser provider is enabled but playwright-cli is not installed.")
       } else if selection?.adapter.playwrightBrowserName == "firefox", !isPlaywrightFirefoxInstalled()
       {
         // The Chrome channel uses the installed Google Chrome, so only the
         // Firefox path needs Playwright's bundled browser.
         issues.append(
-          "ChatGPT is enabled but the Playwright Firefox browser is not installed. Run `playwright-cli install-browser firefox`."
+          "A browser provider is enabled but the Playwright Firefox browser is not installed. Run `playwright-cli install-browser firefox`."
         )
       }
     }
@@ -611,7 +845,7 @@ final class Scraper: @unchecked Sendable {
   }
 
   // The Playwright daemon is spawned detached (re-parented to launchd), and the
-  // only teardown is the in-process `defer` in scrapeChatGPT. If the app quits
+  // only teardown is the in-process `defer` in runBrowserPass. If the app quits
   // or crashes mid-scrape (a rebuild during development is enough), that defer
   // never runs and a headless Firefox is orphaned forever. Run this once at
   // launch — gated by the single-instance lock so it can't reap a live sibling's

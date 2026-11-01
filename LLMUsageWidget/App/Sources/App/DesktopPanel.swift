@@ -216,6 +216,7 @@ private struct DeskProviderSection: View {
   let title: String
   let url: String
   let cards: [(pct: Double, resets: String, models: [ModelUsage])]
+  var horizontalPadding: CGFloat = 18
   @State private var expandedIndex: Int? = nil
 
   private let gap: CGFloat = 8
@@ -248,7 +249,7 @@ private struct DeskProviderSection: View {
       }
     }
     .animation(cardAnimation, value: expandedIndex)
-    .padding(.horizontal, 18)
+    .padding(.horizontal, horizontalPadding)
   }
 }
 
@@ -263,6 +264,7 @@ private struct DeskStatusSection: View {
   var detail: [String] = []
   var severity: DeskSeverity = .low
   let url: String
+  var horizontalPadding: CGFloat = 18
 
   private var isFault: Bool { severity != .low }
 
@@ -291,28 +293,32 @@ private struct DeskStatusSection: View {
         .background(DeskCardBackground(severity: severity, isExpanded: false))
       }.buttonStyle(.plain)
     }
-    .padding(.horizontal, 18)
+    .padding(.horizontal, horizontalPadding)
   }
 }
 
 struct DesktopPanel: View {
   @ObservedObject var model: PanelModel
-  private var chatGPTShown: Bool { model.usage?.chatgptStatus == .on }
-  private var ollamaSignedIn: Bool { model.usage?.resolvedOllamaStatus == .on }
-  // Master switch on but no data at all: a scrape issue explains why, or it's
-  // a sign-in prompt (off stays hidden).
-  private var chatGPTUnavailable: Bool { model.usage?.chatgptStatus == .unavailable }
-  // Numbers on disk but the scrape stopped landing: show the fault, not the gauges.
-  private var chatGPTStale: Bool { model.usage?.chatgptStatus == .stale }
 
-  // Only the meters OpenAI still exposes. A meter parsed as nil (e.g. the 5-hour
-  // limit they dropped) yields no card rather than a fake 0% ring.
-  private var chatGPTCards: [(pct: Double, resets: String, models: [ModelUsage])] {
-    guard let c = model.usage?.chatgpt else { return [] }
-    var cards: [(pct: Double, resets: String, models: [ModelUsage])] = []
-    if let pct = c.fiveHourPct { cards.append((pct, c.fiveHourReset ?? "", [])) }
-    if let pct = c.weeklyPct { cards.append((pct, c.weeklyReset ?? "", [])) }
-    return cards
+  private let ollamaURL = "https://ollama.com/settings"
+  private let chatGPTURL = "https://chatgpt.com/codex/cloud/settings/analytics"
+  private let claudeURL = "https://claude.ai/settings/usage"
+
+  private var chatGPTStatus: ProviderStatus { model.usage?.chatGPTDisplayStatus ?? .off }
+  private var claudeStatus: ProviderStatus { model.usage?.claudeDisplayStatus ?? .off }
+  private var ollamaStatus: OllamaStatus { model.usage?.ollamaDisplayStatus ?? .unavailable }
+  private var providerShown: Bool { chatGPTStatus == .on || claudeStatus == .on }
+  private var browserRowVisible: Bool { chatGPTStatus != .off || claudeStatus != .off }
+
+  // The paired browser row shows the 7-day meter only, half each.
+  private var chatGPTWeeklyCard: [(pct: Double, resets: String, models: [ModelUsage])] {
+    guard let c = model.usage?.chatgpt, let pct = c.weeklyPct else { return [] }
+    return [(pct, c.weeklyReset ?? "", [])]
+  }
+
+  private var claudeWeeklyCard: [(pct: Double, resets: String, models: [ModelUsage])] {
+    guard let c = model.usage?.claude else { return [] }
+    return [(c.weeklyPct, c.weeklyReset, [])]
   }
 
   var body: some View {
@@ -322,64 +328,58 @@ struct DesktopPanel: View {
         Text("Usage").font(.system(size: 13, weight: .semibold)).foregroundColor(DeskTheme.title)
           .shadow(color: DeskTheme.textShadow, radius: 1, y: 1)
         Spacer()
-        if model.isRefreshing {
-          HStack(spacing: 4) {
-            ProgressView().scaleEffect(0.5).frame(height: 10).clipped()
-            Text("Refreshing...").font(.system(size: 9.5)).foregroundColor(DeskTheme.secondaryText)
+        VStack(alignment: .trailing, spacing: 1) {
+          if model.isRefreshing {
+            HStack(spacing: 4) {
+              ProgressView().scaleEffect(0.5).frame(height: 10).clipped()
+              Text("Refreshing...").font(.system(size: 9.5)).foregroundColor(DeskTheme.secondaryText)
+                .monospacedDigit()
+            }.frame(height: 12)
+          } else if let last = model.usage?.headerUpdatedText() {
+            Text("Updated \(last)").font(.system(size: 9.5)).foregroundColor(DeskTheme.secondaryText)
               .monospacedDigit()
-          }.frame(height: 12)
-        } else if let last = model.usage?.lastUpdated {
-          Text("Updated \(last)").font(.system(size: 9.5)).foregroundColor(DeskTheme.secondaryText)
-            .monospacedDigit()
+          }
+          if let note = model.usage?.providerFailureNote() {
+            Text(note).font(.system(size: 8.5, weight: .medium)).foregroundColor(.orange)
+              .lineLimit(1).minimumScaleFactor(0.8)
+          }
         }
       }
       .padding(.horizontal, 18)
       .padding(.bottom, 12)
 
-      if model.isLoading && model.usage == nil && !chatGPTShown {
+      if model.isLoading && model.usage == nil && !providerShown {
         Spacer()
         ProgressView().scaleEffect(0.8)
         Spacer()
-      } else if model.usage == nil, let err = model.errorMessage, !chatGPTShown {
+      } else if model.usage == nil, let err = model.errorMessage, !providerShown {
         Spacer()
         Text(err).font(.system(size: 12)).foregroundColor(DeskTheme.secondaryText)
           .multilineTextAlignment(.center).padding(.horizontal)
         Spacer()
       } else {
         VStack(spacing: 12) {
-          if let o = model.usage?.ollama, ollamaSignedIn {
+          if let o = model.usage?.ollama, ollamaStatus == .on {
             DeskProviderSection(
-              title: "Ollama", url: "https://ollama.com/settings",
+              title: "Ollama", url: ollamaURL,
               cards: [
                 (o.sessionPct, o.sessionResetsIn, o.sessionModels),
                 (o.weeklyPct, o.weeklyResetsIn, o.weeklyModels),
               ])
+          } else if ollamaStatus == .stale {
+            DeskStatusSection(
+              title: "Ollama", message: "Not updating",
+              detail: model.usage?.ollamaStaleDetail ?? [], severity: .elevated, url: ollamaURL)
           } else {
-            DeskStatusSection(
-              title: "Ollama", message: "Sign in to Ollama", url: "https://ollama.com/settings")
+            DeskStatusSection(title: "Ollama", message: "Sign in to Ollama", url: ollamaURL)
           }
-          if chatGPTShown {
+          if browserRowVisible {
             DeskDivider()
-            DeskProviderSection(
-              title: "ChatGPT", url: "https://chatgpt.com/codex/cloud/settings/analytics",
-              cards: chatGPTCards)
-          } else if chatGPTUnavailable {
-            DeskDivider()
-            if let issue = model.usage?.chatgptIssue {
-              DeskStatusSection(
-                title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
-                url: "https://chatgpt.com/codex/cloud/settings/analytics")
-            } else {
-              DeskStatusSection(
-                title: "ChatGPT", message: "Sign in to ChatGPT",
-                url: "https://chatgpt.com/codex/cloud/settings/analytics")
+            HStack(alignment: .top, spacing: 8) {
+              chatGPTSlot.frame(maxWidth: .infinity)
+              claudeSlot.frame(maxWidth: .infinity)
             }
-          } else if chatGPTStale {
-            DeskDivider()
-            DeskStatusSection(
-              title: "ChatGPT", message: "Not updating",
-              detail: model.usage?.chatgptStaleDetail ?? [], severity: .elevated,
-              url: "https://chatgpt.com/codex/cloud/settings/analytics")
+            .padding(.horizontal, 18)
           }
         }
       }
@@ -388,5 +388,54 @@ struct DesktopPanel: View {
     .padding(.vertical, 14)
     .background(DeskPanelBackground())
     .onExitCommand { NSApp.terminate(nil) }
+  }
+
+  @ViewBuilder private var chatGPTSlot: some View {
+    switch chatGPTStatus {
+    case .on:
+      DeskProviderSection(
+        title: "ChatGPT", url: chatGPTURL, cards: chatGPTWeeklyCard, horizontalPadding: 0)
+    case .off:
+      DeskStatusSection(
+        title: "ChatGPT", message: "ChatGPT off", url: chatGPTURL, horizontalPadding: 0)
+    case .unavailable:
+      if let issue = model.usage?.chatgptIssue {
+        DeskStatusSection(
+          title: "ChatGPT", message: "Not updating", detail: [issue], severity: .elevated,
+          url: chatGPTURL, horizontalPadding: 0)
+      } else {
+        DeskStatusSection(
+          title: "ChatGPT", message: "Sign in to ChatGPT", url: chatGPTURL, horizontalPadding: 0)
+      }
+    case .stale:
+      DeskStatusSection(
+        title: "ChatGPT", message: "Not updating",
+        detail: model.usage?.chatgptStaleDetail ?? [], severity: .elevated, url: chatGPTURL,
+        horizontalPadding: 0)
+    }
+  }
+
+  @ViewBuilder private var claudeSlot: some View {
+    switch claudeStatus {
+    case .on:
+      DeskProviderSection(
+        title: "Claude", url: claudeURL, cards: claudeWeeklyCard, horizontalPadding: 0)
+    case .off:
+      DeskStatusSection(title: "Claude", message: "Claude off", url: claudeURL, horizontalPadding: 0)
+    case .unavailable:
+      if let issue = model.usage?.claudeIssue {
+        DeskStatusSection(
+          title: "Claude", message: "Not updating", detail: [issue], severity: .elevated,
+          url: claudeURL, horizontalPadding: 0)
+      } else {
+        DeskStatusSection(
+          title: "Claude", message: "Sign in to Claude", url: claudeURL, horizontalPadding: 0)
+      }
+    case .stale:
+      DeskStatusSection(
+        title: "Claude", message: "Not updating",
+        detail: model.usage?.claudeStaleDetail ?? [], severity: .elevated, url: claudeURL,
+        horizontalPadding: 0)
+    }
   }
 }
