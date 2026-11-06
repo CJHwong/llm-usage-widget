@@ -278,26 +278,26 @@ final class Scraper: @unchecked Sendable {
     case transientFailure(String)
   }
 
-  // OpenAI rewrote the ChatGPT settings UI in Oct 2026 and the analytics page the
-  // old scrape read is gone (the URL now redirects, and a cold automated visit
-  // meets a Cloudflare challenge). The page still fetches its own numbers from
-  // /backend-api/wham/usage, so we load a page and read that response instead of
-  // matching rendered text. Nothing here depends on page copy, so the next
-  // redesign does not break it.
+  // General settings no longer requests usage. Open Usage through the settings
+  // navigation because a direct visit does not reliably request the numbers.
+  // History endpoints share the usage prefix but do not contain usage windows.
   private static let usageCaptureScript = """
     async (page) => {
-      let captured = null;
-      page.on('response', async (res) => {
-        if (!res.url().includes('/backend-api/wham/usage')) return;
-        try { captured = await res.json(); } catch (e) { /* not JSON */ }
-      });
+      const usageResponse = page.waitForResponse(
+        response => new URL(response.url()).pathname === '/backend-api/wham/usage'
+          && response.status() === 200,
+        { timeout: 30000 }
+      ).catch(() => null);
       try {
         await page.goto('https://chatgpt.com/settings/general-settings', {
           waitUntil: 'domcontentloaded', timeout: 25000,
         });
-      } catch (e) { /* a slow load can still have fired the request */ }
-      for (let i = 0; i < 20 && captured === null; i++) await page.waitForTimeout(500);
-      return JSON.stringify(captured);
+        await page.getByText('Usage', { exact: true }).click({ timeout: 5000 });
+        const response = await usageResponse;
+        return JSON.stringify(response ? await response.json() : null);
+      } catch (error) {
+        return JSON.stringify(null);
+      }
     }
     """
 
