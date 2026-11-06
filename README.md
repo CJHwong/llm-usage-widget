@@ -48,7 +48,7 @@ playwright-cli install-browser firefox
 
 Then toggle **Enable ChatGPT** or **Enable Claude** in the menu bar. Each switch gates the (expensive) browser scrape for that provider. Both providers share one Playwright launch, so turning either on runs the same pass. Turn a switch off the same way; the panel and widget update on the next scrape. If a switch is on but that site is not signed in, the large widget shows "Sign in to ChatGPT" or "Sign in to Claude".
 
-Claude reads the `usage` response of the `claude.ai` settings page, and takes only the weekly (`weekly_all`) meter. `claude.ai` sits behind Cloudflare, which sometimes rejects a headless browser. The app retries once, keeps the last good number, and marks it "Not updating" after 15 minutes.
+Claude reads the `usage` response of the `claude.ai` settings page, and takes only the weekly (`weekly_all`) meter. The app retries once, keeps the last good number, and marks it "Not updating" after 15 minutes. The error distinguishes a failed page load, an unsuccessful response status, a missing response, and unreadable usage. A missing response does not confirm a block.
 
 ### If the widget does not appear in the gallery
 

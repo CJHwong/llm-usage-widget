@@ -105,9 +105,11 @@ while the previous one is still running.
 `claude.ai` renders from `GET /api/organizations/<org>/usage`. The scrape loads
 `https://claude.ai/new#settings/usage` in a second Playwright page and captures
 that response only when it is a 200. It reads `limits[kind == weekly_all]`
-(`percent`, `resets_at`), falling back to `seven_day`. Plain curl gets a
-Cloudflare 403, and headless Firefox is intermittent, so the capture retries once
-and ages the last good number into `stale`.
+(`percent`, `resets_at`), falling back to `seven_day`. The capture retries once
+and ages the last good number into `stale`. It reports page load failures,
+unsuccessful response statuses, missing responses, and unreadable usage separately.
+A missing response does not confirm a block. The capture matches the exact
+usage path so other endpoints cannot replace the usage result.
 
 (Earlier iterations gated on a `chatgpt_enabled` container file and then on
 `WidgetCenter.getCurrentConfigurations`; the menu toggle replaced both as a

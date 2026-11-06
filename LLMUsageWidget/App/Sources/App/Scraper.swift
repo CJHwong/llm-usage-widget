@@ -301,27 +301,49 @@ final class Scraper: @unchecked Sendable {
     }
     """
 
-  // claude.ai fetches the same numbers the settings page renders from
-  // /api/organizations/<org>/usage. A fresh page (not the ChatGPT one) keeps the
-  // two captures independent. Only a 200 is accepted: Cloudflare answers the
-  // challenged request with a 403 HTML page, which must not be parsed.
+  // A missing response does not prove a block. Keep the response status and
+  // parse errors separate so the widget can report the observed failure.
   private static let claudeCaptureScript = """
     async (page) => {
       let captured = null;
-      const p = await page.context().newPage();
-      p.on('response', async (res) => {
-        if (!res.url().includes('/api/organizations/') || !res.url().includes('/usage')) return;
-        if (res.status() !== 200) return;
-        try { captured = await res.json(); } catch (e) { /* not JSON */ }
+      let pageStatus = null;
+      let navigationFailed = false;
+      const usagePage = await page.context().newPage();
+      usagePage.on('response', async (response) => {
+        const usagePath = new URL(response.url()).pathname;
+        if (!/^[/]api[/]organizations[/][^/]+[/]usage$/.test(usagePath)) return;
+        if (response.status() !== 200) {
+          captured = { issue: 'Claude usage returned HTTP ' + response.status() };
+          return;
+        }
+        try {
+          captured = { usage: await response.json() };
+        } catch (error) {
+          captured = { issue: 'Claude usage response was not JSON' };
+        }
       });
       try {
-        await p.goto('https://claude.ai/new#settings/usage', {
-          waitUntil: 'domcontentloaded', timeout: 25000,
+        try {
+          const navigation = await usagePage.goto('https://claude.ai/new#settings/usage', {
+            waitUntil: 'domcontentloaded', timeout: 25000,
+          });
+          pageStatus = navigation?.status() ?? null;
+        } catch (error) {
+          navigationFailed = true;
+        }
+        for (let attempt = 0; attempt < 24 && captured === null; attempt++) {
+          await usagePage.waitForTimeout(500);
+        }
+        if (captured !== null) return JSON.stringify(captured);
+        if (pageStatus >= 400) {
+          return JSON.stringify({ issue: 'Claude page returned HTTP ' + pageStatus });
+        }
+        return JSON.stringify({
+          issue: navigationFailed ? 'Claude page did not load' : 'No Claude usage response',
         });
-      } catch (e) { /* a slow load can still have fired the request */ }
-      for (let i = 0; i < 24 && captured === null; i++) await p.waitForTimeout(500);
-      await p.close();
-      return JSON.stringify(captured);
+      } finally {
+        await usagePage.close();
+      }
     }
     """
 
@@ -350,6 +372,11 @@ final class Scraper: @unchecked Sendable {
       case limitWindowSeconds = "limit_window_seconds"
       case resetAt = "reset_at"
     }
+  }
+
+  private struct ClaudeCaptureResponse: Decodable {
+    let usage: ClaudeUsageResponse?
+    let issue: String?
   }
 
   // The slice of /api/organizations/<org>/usage we read. `limits` is the
@@ -604,31 +631,43 @@ final class Scraper: @unchecked Sendable {
       return .transientFailure("Could not stage the Claude capture")
     }
 
-    // Cloudflare let headless Firefox through intermittently in testing, so a
-    // null result gets one clean retry before the cycle gives up.
+    // Intermittent failures get one retry without discarding the last good usage.
+    var lastIssue = "No Claude usage response"
     for attempt in 1...2 {
       let capture = runPlaywrightCommand(
         ["-s=\(sessionName)", "--raw", "run-code", "--filename", scriptFile.path],
         timeout: 45)
       guard let output = capture.output else {
+        lastIssue = "Could not read Claude usage"
         log.error("captureClaude: run-code failed, stderr=\(capture.stderr)")
         continue
       }
       guard let json = try? JSONDecoder().decode(String.self, from: Data(output.utf8)),
-        let response = try? JSONDecoder().decode(ClaudeUsageResponse.self, from: Data(json.utf8)),
+        let captured = try? JSONDecoder().decode(ClaudeCaptureResponse.self, from: Data(json.utf8))
+      else {
+        lastIssue = "Could not decode the Claude capture"
+        log.warning("captureClaude: attempt \(attempt): \(lastIssue, privacy: .public)")
+        continue
+      }
+      if let issue = captured.issue {
+        lastIssue = issue
+        log.warning("captureClaude: attempt \(attempt): \(lastIssue, privacy: .public)")
+        continue
+      }
+      guard let response = captured.usage,
         let parsed = claudeData(from: response)
       else {
-        log.warning("captureClaude: attempt \(attempt) held no usage window")
+        lastIssue = "No Claude weekly usage reported"
+        log.warning("captureClaude: attempt \(attempt): \(lastIssue, privacy: .public)")
         continue
       }
       log.info("captureClaude: parsed - weekly=\(parsed.weeklyPct) reset=\(parsed.weeklyReset)")
       return .success(parsed)
     }
     _lock.withLock {
-      _lastIssueMessage =
-        "Claude opened but reported no usage. Cloudflare may have blocked the request."
+      _lastIssueMessage = lastIssue
     }
-    return .transientFailure("Claude request blocked")
+    return .transientFailure(lastIssue)
   }
 
   // The 5-hour window, in seconds. The API does not label its windows, so the
